@@ -1,0 +1,5 @@
+# Local tooling and build artifacts — not part of the deployable service.
+railway.exe
+node_modules/
+*.tmp
+*.log
