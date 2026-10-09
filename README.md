@@ -45,7 +45,8 @@ Studio 或任何支持 `base_url + API key` 的客户端调用。
 | `STATUS_PATH` | 否 | `~/.opencode2dsh/railway-server.status.json` | 健康快照落盘位置（写入失败不影响服务） |
 | `STATUS_WRITE_INTERVAL_MS` | 否 | `60000` | 请求触发的快照最小写入间隔（目录刷新与停机时强制写） |
 | `SHUTDOWN_DRAIN_MS` | 否 | `5000` | SIGTERM 后给在途流的排空时间，超时才切断连接 |
-| `POOL_WARM_INTERVAL_MS` | 否 | `45000` | 上游连接池保活心跳间隔（见下） |
+| `POOL_WARM_INTERVAL_MS` | 否 | `20000` | 上游连接池保活心跳间隔（见下）。小于对端空闲回收时间，避免空闲后复用「半死」连接 |
+| `POOLED_HEADER_TIMEOUT_MS` | 否 | `2500` | **复用连接看门狗**：仅针对从池里复用的 keep-alive 连接，若该窗口内没收到上游响应头就判为半开失效，立刻换新连接重试一次（新连接不受此限，它本来就要付 DNS+TCP+TLS） |
 | `DNS_TTL_MS` | 否 | `60000` | 上游 DNS 结果缓存时长；解析失败时回退到过期缓存 |
 | `ZEN_API_KEY` | 否 | —（空 = 匿名免费通道） | **上游凭证**。留空就是 `Bearer public` 匿名免费通道；填入 [OpenCode Zen](https://opencode.ai/zen) 的 API key 后，对话与 Responses 都改用你的 key。key 不写日志、不被任何接口回显 |
 | `ZEN_API_KEYS` | 否 | — | **key 池**：逗号 / 分号 / 空白分隔多个 key（与 `ZEN_API_KEY` 同时设置会合并）。多于 1 个即启用池化行为，见下节 |

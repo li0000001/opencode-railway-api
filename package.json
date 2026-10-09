@@ -1,6 +1,6 @@
 {
   "name": "opencode2dsh-railway-server",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "OpenAI-compatible gateway to the OpenCode Zen anonymous free lane, for Railway (and any local run). Reuses opencode2dsh's proven adapter sources.",

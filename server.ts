@@ -103,7 +103,16 @@ const SHUTDOWN_DRAIN_MS = numEnv('SHUTDOWN_DRAIN_MS', 5_000)
 /** Upstream DNS result cache TTL (avoids a lookup per fresh socket). */
 const DNS_TTL_MS = numEnv('DNS_TTL_MS', 60_000)
 /** Pool keep-alive heartbeat: keeps a warm TLS socket across idle periods. */
-const POOL_WARM_INTERVAL_MS = numEnv('POOL_WARM_INTERVAL_MS', 45_000)
+const POOL_WARM_INTERVAL_MS = numEnv('POOL_WARM_INTERVAL_MS', 20_000)
+/**
+ * Stale pooled-socket watchdog. A reused keep-alive socket whose peer vanished
+ * silently (no FIN/RST) accepts the write and then stalls on TCP retransmits
+ * (measured ~6.4s spikes in production). No response headers within this window
+ * on a *reused* socket means it is stale: zenFetch then retries on a fresh
+ * connection. Fresh sockets are never watched — they legitimately spend
+ * DNS+TCP+TLS first.
+ */
+const POOLED_HEADER_TIMEOUT_MS = numEnv('POOLED_HEADER_TIMEOUT_MS', 2_500)
 /** Minimum spacing between health snapshot writes (requests use the throttle). */
 const STATUS_WRITE_INTERVAL_MS = numEnv('STATUS_WRITE_INTERVAL_MS', 60_000)
 
@@ -473,7 +482,10 @@ function buildResponsesUpstreamBody(clientBody: Record<string, unknown>): Record
 const upstreamAgent = new https.Agent({
   keepAlive: true,
   maxSockets: 64,
-  maxFreeSockets: 8,
+  // Only the heartbeat's socket(s) stay hot. Keeping 8 idle sockets around
+  // meant most of them outlived the peer's idle reap and came back half-open
+  // (see POOLED_HEADER_TIMEOUT_MS); two is enough for a single-user lane.
+  maxFreeSockets: 2,
   keepAliveMsecs: 30_000,
 })
 
@@ -624,6 +636,13 @@ async function zenFetchOnce(
     }
     const t0 = Date.now()
     let tlsMs: number | null = null
+    let pooledHeaderTimer: NodeJS.Timeout | null = null
+    const clearPooledHeaderTimer = (): void => {
+      if (pooledHeaderTimer !== null) {
+        clearTimeout(pooledHeaderTimer)
+        pooledHeaderTimer = null
+      }
+    }
     const req = https.request(
       {
         hostname: target.hostname,
@@ -634,6 +653,7 @@ async function zenFetchOnce(
         headers: headerBag,
       },
       (res) => {
+        clearPooledHeaderTimer()
         const headersMs = Date.now() - t0
         const get = (name: string): string | null => {
           const raw = res.headers[name.toLowerCase()]
@@ -665,8 +685,21 @@ async function zenFetchOnce(
     req.on('socket', (socket) => {
       // Small SSE chunks must leave immediately; Nagle only adds latency.
       socket.setNoDelay(true)
-      if (socket.connecting) socket.once('secureConnect', () => { tlsMs = Date.now() - t0 })
-      else tlsMs = 0 // pooled socket reused: no handshake at all
+      if (socket.connecting) {
+        socket.once('secureConnect', () => { tlsMs = Date.now() - t0 })
+      } else {
+        tlsMs = 0 // pooled socket reused: no handshake at all
+        // A reused socket may have been reaped by the peer *silently*: the
+        // write succeeds and we would then wait on TCP retransmits (~6s
+        // measured) before the RST. Flag it ECONNRESET so zenFetch retries
+        // once on a fresh connection instead of stalling.
+        pooledHeaderTimer = setTimeout(() => {
+          const stale = new Error('stale pooled socket (no response headers)') as NodeJS.ErrnoException
+          stale.code = 'ECONNRESET'
+          req.destroy(stale)
+        }, POOLED_HEADER_TIMEOUT_MS)
+        pooledHeaderTimer.unref?.()
+      }
     })
     // Cover the connect/prefix phase: our watchdogs take over once headers land.
     req.setTimeout(Math.max(FIRST_EVENT_MS, BODY_IDLE_MS), () => {
@@ -675,6 +708,7 @@ async function zenFetchOnce(
     const onAbort = (): void => req.destroy(new Error('aborted'))
     signal.addEventListener('abort', onAbort, { once: true })
     req.on('error', (err) => {
+      clearPooledHeaderTimer()
       signal.removeEventListener('abort', onAbort)
       reject(err)
     })
