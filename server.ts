@@ -12,10 +12,11 @@
  *
  * Endpoints (all but /health require `Authorization: Bearer <API_KEY>`):
  *   GET  /health            liveness + catalog status
- *   GET  /v1/models         OpenAI model list (chat-capable free models;
- *                           ?include_responses=true adds the muse-spark-* ones)
+ *   GET  /v1/models         OpenAI model list (every exposed free model; each
+ *                           row carries "api": "chat" | "responses")
  *   GET  /v1/models/{id}    single model entry
  *   POST /v1/chat/completions  streaming relay or buffered non-stream
+ *                           (Responses-only models are bridged transparently)
  *   POST /v1/responses      Responses-API passthrough (muse-spark-* etc.)
  *
  * Zero runtime dependencies: Node >= 22.18 runs TypeScript natively.
@@ -1164,27 +1165,31 @@ function responsesSeedMessages(input: unknown): Array<{ role: string; content: u
 }
 
 /**
- * `GET /v1/models` — the chat-capable list by default, byte-identical to the
- * OpenAI shape. Responses-only models (`muse-spark-*`, useless to a chat
- * client: upstream answers a bare 500 on /chat/completions) are excluded from
- * it, but discoverable on request:
- *   ?include_responses=true  (or ?api=responses) also lists them, and every
- *   row then carries `"api": "chat" | "responses"` so a consumer can route.
+ * `GET /v1/models` — every exposed free model, byte-identical to the OpenAI
+ * shape plus an extra `"api"` field so a consumer can route:
+ *   `"chat"`      fully native on POST /v1/chat/completions
+ *   `"responses"` Responses-only (`muse-spark-*`): also usable on
+ *                 /v1/chat/completions (the gateway bridges the protocol),
+ *                 and native clients should prefer POST /v1/responses.
+ *
+ * Local change (2026-10-13): Responses-only models used to be hidden unless
+ * `?include_responses=true`, because the upstream answers a bare 500 when they
+ * reach /chat/completions speaking the chat protocol. Two things changed: they
+ * are no longer region-blocked once the service runs outside the restricted
+ * country, and the chat path now bridges them instead of rejecting them. They
+ * are therefore listed by default; `?include_responses=true` still parses as a
+ * no-op for backwards compatibility.
  */
-function handleModels(res: ServerResponse, query: URLSearchParams): void {
-  const includeResponses =
-    query.get('include_responses') === 'true' || query.get('api') === 'responses'
-  const all = catalog.list()
-  const ids = includeResponses ? all : all.filter((id) => !isResponsesModel(id))
+function handleModels(res: ServerResponse): void {
   const created = Math.floor(Date.now() / 1000)
   sendJson(res, 200, {
     object: 'list',
-    data: ids.map((id) => ({
+    data: catalog.list().map((id) => ({
       id,
       object: 'model',
       created,
       owned_by: 'opencode-zen',
-      ...(includeResponses ? { api: isResponsesModel(id) ? 'responses' : 'chat' } : {}),
+      api: isResponsesModel(id) ? 'responses' : 'chat',
     })),
   })
 }
@@ -1230,14 +1235,6 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse): 
     apiError(res, 400, 'missing required parameter: model')
     return
   }
-  if (isResponsesModel(model)) {
-    apiError(
-      res,
-      400,
-      `model "${model}" only speaks the Responses API — call POST /v1/responses instead, or pick a chat model from GET /v1/models`,
-    )
-    return
-  }
   if (!Array.isArray(clientBody.messages) || clientBody.messages.length === 0) {
     apiError(res, 400, 'missing required parameter: messages (must be a non-empty array)')
     return
@@ -1245,6 +1242,13 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse): 
   const exposure = modelExposureError(model)
   if (exposure) {
     apiError(res, 404, exposure, 'model_not_found')
+    return
+  }
+  // Responses-only models (muse-spark-*) make the upstream answer a bare 500
+  // when the chat protocol reaches it, so the gateway translates rather than
+  // rejects: chat request in, /v1/responses upstream, chat response out.
+  if (isResponsesModel(model)) {
+    await handleChatViaResponses(req, res, clientBody, model)
     return
   }
 
@@ -1315,6 +1319,619 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse): 
     const sse = await readSse(upstream, controller)
     const completion = aggregateChatCompletion(sse, model)
     sendJson(res, 200, completion)
+  } finally {
+    req.off('close', onClose)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chat <-> Responses bridge for Responses-only models (muse-spark-*)
+//
+// Zen answers a bare 500 when these models arrive over the chat protocol, and
+// their region block is what used to make them invisible from inside a
+// restricted country. A chat client must therefore never see the protocol
+// difference: the request is translated on the way out, the response (deltas
+// included, so the typewriter effect survives) on the way back.
+// ---------------------------------------------------------------------------
+
+/** Flatten an OpenAI chat `content` (string or parts array) into plain text. */
+function chatText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        const p = part as Record<string, unknown>
+        return typeof p?.text === 'string' ? p.text : ''
+      })
+      .join('')
+  }
+  return ''
+}
+
+/**
+ * Chat Completions request -> Responses request. Every field with a Responses
+ * spelling is translated: system/developer turns become `instructions`,
+ * assistant tool calls and tool results become `function_call` /
+ * `function_call_output` items, and the nested chat tool schema is flattened
+ * (which is also what the free-lane gate expects).
+ */
+function chatRequestToResponsesBody(clientBody: Record<string, unknown>): Record<string, unknown> {
+  const messages = Array.isArray(clientBody.messages)
+    ? (clientBody.messages as Array<Record<string, unknown>>)
+    : []
+  const input: Record<string, unknown>[] = []
+  const instructions: string[] = []
+
+  for (const message of messages) {
+    const role = typeof message.role === 'string' ? message.role : 'user'
+    if (role === 'system' || role === 'developer') {
+      const text = chatText(message.content)
+      if (text) instructions.push(text)
+      continue
+    }
+    if (role === 'tool') {
+      input.push({
+        type: 'function_call_output',
+        call_id: typeof message.tool_call_id === 'string' ? message.tool_call_id : '',
+        output: chatText(message.content),
+      })
+      continue
+    }
+    if (role === 'assistant') {
+      const text = chatText(message.content)
+      if (text) input.push({ role: 'assistant', content: text })
+      if (Array.isArray(message.tool_calls)) {
+        for (const raw of message.tool_calls as Array<Record<string, unknown>>) {
+          const fn = (raw.function ?? {}) as Record<string, unknown>
+          input.push({
+            type: 'function_call',
+            call_id: typeof raw.id === 'string' ? raw.id : '',
+            name: typeof fn.name === 'string' ? fn.name : '',
+            arguments:
+              typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {}),
+          })
+        }
+      }
+      continue
+    }
+    input.push({ role, content: chatText(message.content) })
+  }
+
+  const tools = Array.isArray(clientBody.tools)
+    ? (clientBody.tools as Array<Record<string, unknown>>)
+        .filter((tool) => tool?.type === 'function' && tool.function)
+        .map((tool) => {
+          const fn = tool.function as Record<string, unknown>
+          return {
+            type: 'function',
+            name: fn.name,
+            ...(fn.description === undefined ? {} : { description: fn.description }),
+            ...(fn.parameters === undefined ? {} : { parameters: fn.parameters }),
+          }
+        })
+    : []
+
+  const out: Record<string, unknown> = { model: clientBody.model, input, stream: true }
+  const instructionText = instructions.join('\n\n')
+  if (instructionText) out.instructions = instructionText
+  if (tools.length > 0) {
+    out.tools = tools
+    // Zen's Responses gateway accepts `auto` only (see ensureResponsesFreeLaneShape).
+    out.tool_choice = 'auto'
+  }
+  if (typeof clientBody.temperature === 'number') out.temperature = clientBody.temperature
+  if (typeof clientBody.top_p === 'number') out.top_p = clientBody.top_p
+  if (typeof clientBody.max_completion_tokens === 'number') {
+    out.max_output_tokens = clientBody.max_completion_tokens
+  } else if (typeof clientBody.max_tokens === 'number') {
+    out.max_output_tokens = clientBody.max_tokens
+  }
+  if (clientBody.reasoning !== undefined) out.reasoning = clientBody.reasoning
+  else if (typeof clientBody.reasoning_effort === 'string') {
+    out.reasoning = { effort: clientBody.reasoning_effort }
+  }
+  return out
+}
+
+interface ChatToolCallOut {
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
+}
+
+/** Responses `output` items -> the chat message they are equivalent to. */
+function responsesOutputToChat(output: unknown): {
+  content: string
+  reasoning: string
+  toolCalls: ChatToolCallOut[]
+} {
+  let content = ''
+  let reasoning = ''
+  const toolCalls: ChatToolCallOut[] = []
+  if (!Array.isArray(output)) return { content, reasoning, toolCalls }
+
+  for (const raw of output) {
+    const item = raw as Record<string, unknown>
+    if (!item || typeof item !== 'object') continue
+    if (item.type === 'message') {
+      const parts = Array.isArray(item.content) ? item.content : []
+      for (const rawPart of parts) {
+        const part = rawPart as Record<string, unknown>
+        if (part?.type === 'output_text' && typeof part.text === 'string') content += part.text
+        else if (typeof part?.refusal === 'string') content += part.refusal
+      }
+    } else if (item.type === 'reasoning') {
+      const parts = Array.isArray(item.summary)
+        ? item.summary
+        : Array.isArray(item.content)
+          ? item.content
+          : []
+      for (const rawPart of parts) {
+        const part = rawPart as Record<string, unknown>
+        if (typeof part?.text === 'string') reasoning += part.text
+      }
+    } else if (item.type === 'function_call') {
+      toolCalls.push({
+        id:
+          typeof item.call_id === 'string' && item.call_id
+            ? item.call_id
+            : typeof item.id === 'string'
+              ? item.id
+              : `call_${toolCalls.length}`,
+        type: 'function',
+        function: {
+          name: typeof item.name === 'string' ? item.name : '',
+          arguments: typeof item.arguments === 'string' ? item.arguments : '',
+        },
+      })
+    }
+  }
+  return { content, reasoning, toolCalls }
+}
+
+/** Responses usage -> chat usage (`input_tokens`/`output_tokens` are the names). */
+function responsesUsageToChat(usage: unknown): ChatAggregate['usage'] {
+  const u = (usage ?? {}) as Record<string, unknown>
+  const prompt = typeof u.input_tokens === 'number' ? u.input_tokens : 0
+  const completion = typeof u.output_tokens === 'number' ? u.output_tokens : 0
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: typeof u.total_tokens === 'number' ? u.total_tokens : prompt + completion,
+  }
+}
+
+/** The final Responses object -> one Chat Completions object. */
+function responsesToChatCompletion(
+  response: Record<string, unknown>,
+  fallbackModel: string,
+): ChatAggregate {
+  const { content, reasoning, toolCalls } = responsesOutputToChat(response.output)
+  const message: ChatAggregate['choices'][0]['message'] = {
+    role: 'assistant',
+    content: content || null,
+  }
+  if (reasoning) message.reasoning_content = reasoning
+  if (toolCalls.length > 0) message.tool_calls = toolCalls
+  let finishReason = toolCalls.length > 0 ? 'tool_calls' : 'stop'
+  if (response.status === 'incomplete') finishReason = 'length'
+  return {
+    id:
+      typeof response.id === 'string' && response.id
+        ? response.id
+        : `chatcmpl-${randomBytes(8).toString('hex')}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: typeof response.model === 'string' ? response.model : fallbackModel,
+    choices: [{ index: 0, message, finish_reason: finishReason }],
+    usage: responsesUsageToChat(response.usage),
+  }
+}
+
+interface ResponsesChatStreamState {
+  id: string
+  model: string
+  created: number
+  roleSent: boolean
+  /** Responses output_index -> chat tool_calls index (function_call items only). */
+  toolIndexes: Map<number, number>
+  nextToolIndex: number
+  /** True once any real payload (text/reasoning/tool call) has been emitted. */
+  sawPayload: boolean
+  finished: boolean
+}
+
+function newResponsesChatStreamState(model: string): ResponsesChatStreamState {
+  return {
+    id: `chatcmpl-${randomBytes(8).toString('hex')}`,
+    model,
+    created: Math.floor(Date.now() / 1000),
+    roleSent: false,
+    toolIndexes: new Map(),
+    nextToolIndex: 0,
+    sawPayload: false,
+    finished: false,
+  }
+}
+
+function chatStreamChunk(
+  state: ResponsesChatStreamState,
+  delta: Record<string, unknown>,
+  finishReason: string | null = null,
+  usage?: ChatAggregate['usage'],
+): string {
+  const payload: Record<string, unknown> = {
+    id: state.id,
+    object: 'chat.completion.chunk',
+    created: state.created,
+    model: state.model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  }
+  if (usage) payload.usage = usage
+  return `data: ${JSON.stringify(payload)}\n\n`
+}
+
+function reasoningStreamDelta(text: string): Record<string, unknown> {
+  return REASONING_DUAL_WRITE
+    ? { reasoning_content: text, reasoning: text }
+    : { reasoning_content: text }
+}
+
+function failedEvent(type: string, message: string): string {
+  return `event: ${type}\ndata: ${JSON.stringify({ error: { message, type: 'upstream_error' } })}\n\n`
+}
+
+/**
+ * One Responses stream event -> zero or more Chat Completions chunks. Unknown
+ * event types are ignored on purpose: the Responses protocol keeps growing and
+ * an unrecognised event must never break an otherwise healthy stream.
+ */
+function responsesEventToChatChunks(
+  event: Record<string, unknown>,
+  state: ResponsesChatStreamState,
+): string[] {
+  const out: string[] = []
+  const type = typeof event.type === 'string' ? event.type : ''
+  const ensureRole = (): void => {
+    if (state.roleSent) return
+    state.roleSent = true
+    out.push(chatStreamChunk(state, { role: 'assistant', content: '' }))
+  }
+
+  if (type === 'response.created' || type === 'response.in_progress') {
+    const response = event.response as Record<string, unknown> | undefined
+    if (response) {
+      if (typeof response.id === 'string' && response.id) state.id = response.id
+      if (typeof response.model === 'string' && response.model) state.model = response.model
+    }
+    ensureRole()
+    return out
+  }
+
+  if (type === 'response.output_text.delta' && typeof event.delta === 'string') {
+    ensureRole()
+    state.sawPayload = true
+    out.push(chatStreamChunk(state, { content: event.delta }))
+    return out
+  }
+
+  if (
+    (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta') &&
+    typeof event.delta === 'string'
+  ) {
+    ensureRole()
+    state.sawPayload = true
+    out.push(chatStreamChunk(state, reasoningStreamDelta(event.delta)))
+    return out
+  }
+
+  if (type === 'response.output_item.added') {
+    const item = event.item as Record<string, unknown> | undefined
+    if (item?.type === 'function_call') {
+      ensureRole()
+      const outputIndex = typeof event.output_index === 'number' ? event.output_index : 0
+      const index = state.nextToolIndex++
+      state.toolIndexes.set(outputIndex, index)
+      state.sawPayload = true
+      out.push(
+        chatStreamChunk(state, {
+          tool_calls: [
+            {
+              index,
+              id:
+                typeof item.call_id === 'string' && item.call_id ? item.call_id : `call_${index}`,
+              type: 'function',
+              function: { name: typeof item.name === 'string' ? item.name : '', arguments: '' },
+            },
+          ],
+        }),
+      )
+    }
+    return out
+  }
+
+  if (type === 'response.function_call_arguments.delta' && typeof event.delta === 'string') {
+    ensureRole()
+    const outputIndex = typeof event.output_index === 'number' ? event.output_index : 0
+    const index = state.toolIndexes.get(outputIndex) ?? 0
+    state.sawPayload = true
+    out.push(
+      chatStreamChunk(state, { tool_calls: [{ index, function: { arguments: event.delta } }] }),
+    )
+    return out
+  }
+
+  if (type === 'response.completed' || type === 'response.incomplete') {
+    const response = (event.response ?? {}) as Record<string, unknown>
+    ensureRole()
+    if (!state.sawPayload) {
+      // No delta events arrived (or this gateway names them differently): fall
+      // back to the aggregated final answer so the client still gets the text.
+      const { content, reasoning, toolCalls } = responsesOutputToChat(response.output)
+      if (content) {
+        out.push(chatStreamChunk(state, { content }))
+        state.sawPayload = true
+      }
+      if (reasoning) {
+        out.push(chatStreamChunk(state, reasoningStreamDelta(reasoning)))
+        state.sawPayload = true
+      }
+      if (toolCalls.length > 0) {
+        out.push(
+          chatStreamChunk(state, {
+            tool_calls: toolCalls.map((call, index) => ({ index, ...call })),
+          }),
+        )
+        state.sawPayload = true
+      }
+    }
+    const finishReason =
+      state.toolIndexes.size > 0 ? 'tool_calls' : response.status === 'incomplete' ? 'length' : 'stop'
+    state.finished = true
+    out.push(chatStreamChunk(state, {}, finishReason, responsesUsageToChat(response.usage)))
+    out.push('data: [DONE]\n\n')
+    return out
+  }
+
+  if (type === 'response.failed') {
+    const response = (event.response ?? {}) as Record<string, unknown>
+    const error = (response.error ?? {}) as Record<string, unknown>
+    const message =
+      typeof error.message === 'string' ? error.message : 'Responses upstream failed the request'
+    state.finished = true
+    out.push(failedEvent('error', message))
+    out.push('data: [DONE]\n\n')
+    return out
+  }
+
+  if (type === 'error') {
+    const error = (event.error ?? event) as Record<string, unknown>
+    const message = typeof error.message === 'string' ? error.message : 'Responses upstream error'
+    state.finished = true
+    out.push(failedEvent('error', message))
+    out.push('data: [DONE]\n\n')
+  }
+  return out
+}
+
+/** SSE relay that rewrites a Responses stream into a chat.completion stream. */
+async function relayResponsesAsChatStream(
+  upstream: UpstreamResponse,
+  res: ServerResponse,
+  controller: AbortController,
+  model: string,
+  headersSent = false,
+): Promise<void> {
+  if (!headersSent) writeSseHead(res)
+  const state = newResponsesChatStreamState(model)
+
+  let firstEvent = true
+  let idleTimer: NodeJS.Timeout | undefined
+  let timedOut = false
+  const t0 = Date.now()
+  let ttfbLogged = false
+  const decoder = new TextDecoder('utf-8')
+  let pending = ''
+
+  const armIdle = (): void => {
+    if (idleTimer) clearTimeout(idleTimer)
+    idleTimer = setTimeout(
+      () => {
+        timedOut = true
+        controller.abort()
+      },
+      firstEvent ? FIRST_EVENT_MS : BODY_IDLE_MS,
+    )
+    idleTimer.unref?.()
+  }
+
+  const write = async (data: string): Promise<boolean> => {
+    if (res.destroyed || res.writableEnded) return false
+    let flushed: boolean
+    try {
+      flushed = res.write(data)
+    } catch {
+      return false
+    }
+    if (!flushed) {
+      await Promise.race([
+        once(res, 'drain').then(() => true),
+        new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), BODY_IDLE_MS)
+          timer.unref?.()
+        }),
+      ])
+    }
+    return !res.destroyed && !res.writableEnded
+  }
+
+  /** Only `data:` lines matter: every Responses payload carries its own type. */
+  const handleLine = async (line: string): Promise<boolean> => {
+    if (!line.startsWith('data:')) return true
+    const data = line.slice(5).trim()
+    if (!data || data === '[DONE]') return true
+    let event: Record<string, unknown>
+    try {
+      event = JSON.parse(data) as Record<string, unknown>
+    } catch {
+      return true
+    }
+    for (const chunk of responsesEventToChatChunks(event, state)) {
+      if (!(await write(chunk))) return false
+    }
+    return true
+  }
+
+  armIdle()
+  try {
+    if (!upstream.body) throw new Error('upstream response has no body')
+    for await (const raw of upstream.body as unknown as AsyncIterable<Uint8Array>) {
+      if (!ttfbLogged) {
+        ttfbLogged = true
+        stats.lastTtfbMs = Date.now() - t0
+        console.log(`[upstream] ttfb=${Date.now() - t0}ms (responses->chat bridge)`)
+      }
+      firstEvent = false
+      armIdle()
+      pending += decoder.decode(raw, { stream: true })
+      let newline = pending.indexOf('\n')
+      while (newline !== -1) {
+        const line = pending.slice(0, newline).replace(/\r$/, '')
+        pending = pending.slice(newline + 1)
+        if (!(await handleLine(line))) {
+          controller.abort()
+          return
+        }
+        newline = pending.indexOf('\n')
+      }
+    }
+    pending += decoder.decode()
+    for (const line of pending.split('\n')) {
+      if (!(await handleLine(line.replace(/\r$/, '')))) break
+    }
+    if (!state.finished) {
+      // Upstream ended without a terminal event: close the stream cleanly
+      // rather than leaving the client waiting on a half-finished answer.
+      await write(chatStreamChunk(state, {}, 'stop', responsesUsageToChat(undefined)))
+      await write('data: [DONE]\n\n')
+    }
+    if (!res.writableEnded && !res.destroyed) res.end()
+    console.log(`[upstream] stream total=${Date.now() - t0}ms (responses->chat bridge)`)
+  } catch (err) {
+    if (timedOut) {
+      emitSseError(
+        res,
+        `stream watchdog fired (first event ${FIRST_EVENT_MS}ms / body idle ${BODY_IDLE_MS}ms)`,
+      )
+    } else if (!res.writableEnded && !res.destroyed) {
+      const message = err instanceof Error ? err.message : String(err)
+      emitSseError(res, `upstream stream broken: ${message}`)
+    }
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer)
+  }
+}
+
+/**
+ * Serve a Chat Completions request for a Responses-only model: translate in,
+ * call /v1/responses, translate back (streaming deltas or one aggregated JSON).
+ */
+async function handleChatViaResponses(
+  req: IncomingMessage,
+  res: ServerResponse,
+  clientBody: Record<string, unknown>,
+  model: string,
+): Promise<void> {
+  const wantsStream = clientBody.stream === true
+  let upstreamBody: Record<string, unknown>
+  try {
+    upstreamBody = buildResponsesUpstreamBody(chatRequestToResponsesBody(clientBody))
+  } catch (err) {
+    apiError(res, 400, err instanceof Error ? err.message : 'invalid request body')
+    return
+  }
+
+  const controller = new AbortController()
+  const onClose = (): void => controller.abort()
+  req.on('close', onClose)
+
+  const earlyHead = wantsStream && EARLY_SSE_HEADERS
+  if (earlyHead) writeSseHead(res)
+  const fail = (
+    status: number,
+    message: string,
+    type: string,
+    headers?: Record<string, string>,
+  ): void => {
+    if (earlyHead) emitSseError(res, message, type)
+    else apiError(res, status, message, type, headers)
+  }
+
+  const tReq = Date.now()
+  let upstream: UpstreamResponse
+  try {
+    upstream = await zenFetch(
+      ZEN_RESPONSES_URL,
+      upstreamBody,
+      responsesSeedMessages(upstreamBody.input),
+      controller.signal,
+    )
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    fail(502, `cannot reach Zen upstream: ${message}`, 'upstream_error')
+    req.off('close', onClose)
+    return
+  }
+  stats.lastConnectMs = Date.now() - tReq
+  stats.lastUpstreamStatus = upstream.status
+  console.log(
+    `[upstream] connect=${stats.lastConnectMs}ms (tls=${upstream.timings.tlsMs ?? '-'}ms waitHeaders=${upstream.timings.headersMs}ms)`,
+  )
+  try {
+    if (!upstream.ok) {
+      if (earlyHead) {
+        const text = await upstream.text().catch(() => '')
+        const described = describeUpstreamError(upstream, text)
+        stats.lastUpstreamError = described.message
+        emitSseError(res, described.message, described.type)
+        return
+      }
+      await relayUpstreamError(upstream, res)
+      return
+    }
+    stats.lastUpstreamError = ''
+    if (wantsStream) {
+      await relayResponsesAsChatStream(upstream, res, controller, model, earlyHead)
+      return
+    }
+    const sse = await readSse(upstream, controller)
+    let final: Record<string, unknown> | undefined
+    for (const line of sse.split('\n')) {
+      if (!line.startsWith('data:')) continue
+      const data = line.slice(5).trim()
+      if (!data || data === '[DONE]') continue
+      try {
+        const event = JSON.parse(data) as Record<string, unknown>
+        if (
+          (event.type === 'response.completed' || event.type === 'response.incomplete') &&
+          event.response &&
+          typeof event.response === 'object'
+        ) {
+          final = event.response as Record<string, unknown>
+        }
+        if (event.type === 'response.failed') {
+          apiError(res, 502, 'Responses upstream reported a failed response', 'upstream_error')
+          return
+        }
+      } catch {
+        // skip malformed lines
+      }
+    }
+    if (!final) {
+      apiError(res, 502, 'upstream produced no response.completed event', 'upstream_error')
+      return
+    }
+    sendJson(res, 200, responsesToChatCompletion(final, model))
   } finally {
     req.off('close', onClose)
   }
@@ -1490,7 +2107,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (req.method === 'GET' && path === '/v1/models') {
-    handleModels(res, url.searchParams)
+    handleModels(res)
     return
   }
   const modelMatch = /^\/v1\/models\/([^/]+)$/.exec(path)

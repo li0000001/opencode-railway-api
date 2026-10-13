@@ -24,17 +24,20 @@ Studio 或任何支持 `base_url + API key` 的客户端调用。
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 存活 + 目录状态（无需鉴权，Railway 健康检查用） |
-| GET | `/v1/models` | OpenAI 模型列表（默认仅 chat 可用的免费模型；`?include_responses=true` 一并列出 `muse-spark-*`，每行带 `"api": "chat"\|"responses"`） |
+| GET | `/v1/models` | OpenAI 模型列表（**列全部免费模型**，含 `muse-spark-*`；每行带 `"api": "chat"\|"responses"`；`?include_responses=true` 仍接受但已是空参数） |
 | GET | `/v1/models/{id}` | 单个模型（响应含 `api` 字段，responses-only 模型也可查到） |
-| POST | `/v1/chat/completions` | 流式透传 / 非流式聚合（含工具调用、reasoning） |
-| POST | `/v1/responses` | Responses API 直通（`muse-spark-*` 必须走这里——上游对它们的 chat 接口回裸 500） |
+| POST | `/v1/chat/completions` | 流式透传 / 非流式聚合（含工具调用、reasoning）；`muse-spark-*` 在此**自动桥接**到 Responses 协议 |
+| POST | `/v1/responses` | Responses API 直通（原生 Responses 客户端可用） |
 
 除 `/health` 外都需要 `Authorization: Bearer <API_KEY>`。
 
-> **Muse Spark 为什么不默认出现在 `/v1/models`**：`muse-spark-*` 只支持 Responses
-> 协议，列进 chat 列表会让 OpenWebUI 这类客户端选中即失败（插件实测记录：
-> opencode #44659/#44847、DSH #3957）。要发现它们：
-> `GET /v1/models?include_responses=true`。
+> **`muse-spark-*` 现在默认列出且可直接使用**：这两个模型只支持 Responses
+> 协议，原本列进 chat 列表会让 OpenWebUI 这类只会 chat 的客户端「选中即失败」
+> （插件实测记录：opencode #44659/#44847、DSH #3957），所以过去只能靠
+> `?include_responses=true` 发现。现在网关在 `/v1/chat/completions` 上为它们做了
+> **协议桥接**（请求 chat→Responses，响应 Responses→chat，流式增量逐个转换），
+> 因此默认列出也不会坏。它们以前在你本地不可见还有第二层原因：受限国家请求它们
+> 会拿到 `403 RegionError`；服务搬到美国后该限制消失。
 
 ## 本地补丁（2026-10-13，必须保留）
 
@@ -74,6 +77,32 @@ Studio 或任何支持 `base_url + API key` 的客户端调用。
 
 实测（本机匿名模式，连续 6 次流式 + 3 次非流式）：修复前流式必现 502，修复后
 **9/9 全部 200**，`/health` 的 `upstreamAuth` 为 `anonymous`。
+
+### 3. `server.ts` — `muse-spark-*` 的 chat ↔ Responses 桥接
+
+上游对 `muse-spark-*` 的 chat 接口回裸 500（这两个模型只会说 Responses 协议），
+原实现因此把它们从 `/v1/models` 默认列表剔除，并在 chat 接口上**硬拒**
+（400 `only speaks the Responses API`）。现在改为**透明桥接**：列表默认全列，
+客户端选中即可用。
+
+- `chatRequestToResponsesBody`：`messages` → `input`（system/developer 合成
+  `instructions`；assistant 的 `tool_calls` → `function_call`；`role: "tool"` →
+  `function_call_output`），嵌套的 chat 工具 schema 拍平为 Responses 的扁平格式，
+  `max_tokens` → `max_output_tokens`，`reasoning_effort` → `reasoning.effort`；
+- `responsesEventToChatChunks`：Responses 流事件 → chat chunk
+  （`response.output_text.delta` → `delta.content`；`response.reasoning_*_text.delta`
+  → `reasoning_content`/`reasoning`；`function_call_arguments.delta` → `tool_calls`
+  增量；`response.completed` → 带 `finish_reason` 与 usage 的收尾块 + `data: [DONE]`）；
+- 未知事件类型一律忽略；若上游始终不发增量事件，则在 `completed` 时用聚合结果兜底
+  补一次全文，保证客户端一定拿得到答案；
+- 转换后的 body 仍要过 `ensureResponsesFreeLaneShape`，所以 `ffe`、伪装头、
+  `stream:true`、`bash`+`read` 四条门禁照旧由既有逻辑保证，桥接不碰门禁。
+
+本机验证（受限国家 + 匿名通道）：`/v1/models` → 11 个（9 个 chat + 2 个
+responses）；在 chat 接口请求 `muse-spark-1.2-contributor-free` 能通过门禁直达
+上游，只被国家限制拦回 `RegionError`（**不是** `FreeTierError` 或 400，说明请求
+形状正确）；同一时刻 `big-pickle` 仍正常 200。转换逻辑另有 33 条离线单测
+（请求翻译、流式增量、工具调用、无增量兜底、错误映射、非流式聚合）全绿。
 
 ## 环境变量
 
@@ -275,7 +304,8 @@ curl -H "Authorization: Bearer test-key" -H "Content-Type: application/json" \
   请求波动很大，属于免费共享通道的正常抖动；日志里 `[upstream] connect/…
   ttfb/stream total` 可逐请求核对。
 - **地区封锁**：部分模型（如 `muse-spark-*`）对特定出口国家返回
-  `403 RegionError`，上游会原样透传。
+  `403 RegionError`，上游会原样透传。把服务部署在不受限地区（如美国）即可绕过，
+  这也是 `muse-spark-*` 能默认列出并直接使用的前提。
 - **匿名配额按出口 IP 限流**：触发 429 需等待窗口恢复；Railway 出口 IP 是
   共享的，高峰期可能更容易撞限。上游返回的 `retry-after` 会原样透传，
   请让客户端按它退避而不是立刻重试。
