@@ -1,0 +1,12 @@
+# Never ship local credentials or junk into the image / build context.
+# Railway uploads this directory as the build context, so `.env` would otherwise
+# be sent to the builder even though the Dockerfile does not COPY it.
+node_modules
+.git
+.gitignore
+.env
+.env.*
+*.env
+railway.exe
+*.log
+*.tmp

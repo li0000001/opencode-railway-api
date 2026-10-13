@@ -3,3 +3,8 @@ railway.exe
 node_modules/
 *.tmp
 *.log
+
+# Secrets - never commit local credential files (Railway holds the real vars).
+.env
+.env.*
+*.env

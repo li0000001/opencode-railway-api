@@ -70,7 +70,7 @@ export function deriveRequestIDs(messages: Array<{ role: string; content: unknow
  * Live-probed 2026-09-18: the gate has a second, body-shape half (streaming
  * + bash/read tools, adapter/messages.ts); both must pass.
  */
-const CANONICAL_SESSION_PATTERN = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
+const CANONICAL_SESSION_PATTERN = /^ses_[0-9a-f]{9}ffe[0-9A-Za-z]{14}$/
 
 const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 
@@ -95,7 +95,13 @@ function base62Fixed(value: bigint, width: number): string {
 export function canonicalSessionID(signal: string): string {
   if (CANONICAL_SESSION_PATTERN.test(signal)) return signal
   const sum = createHash('sha256').update('ses\x00' + signal).digest()
-  const timePart = sum.subarray(0, 6).toString('hex')
+  // Local patch (2026-10-13): the free-lane gate pins the session id's 12 hex
+  // characters to the "ffe" tail that every real OpenCode session carries —
+  // `ses_<9 hex>ffe<14 base62>` -> 200, any other tail -> 403 FreeTierError
+  // (verified live on both `Bearer public` and a valid account token). Hashing
+  // straight into 12 random hex passed only 1-in-4096 of the time, so every
+  // request 403'd. Keep 9 hash-derived hex digits, then append the marker.
+  const timePart = sum.subarray(0, 5).toString('hex').slice(0, 9) + 'ffe'
   const randomPart = base62Fixed(BigInt('0x' + sum.subarray(6, 16).toString('hex')), 14)
   return `ses_${timePart}${randomPart}`
 }

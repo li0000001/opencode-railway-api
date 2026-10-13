@@ -111,8 +111,14 @@ const POOL_WARM_INTERVAL_MS = numEnv('POOL_WARM_INTERVAL_MS', 20_000)
  * on a *reused* socket means it is stale: zenFetch then retries on a fresh
  * connection. Fresh sockets are never watched — they legitimately spend
  * DNS+TCP+TLS first.
+ *
+ * Local patch (2026-10-13): default raised 2_500 -> 10_000. Zen routinely needs
+ * 2.6-7.2s to emit response headers, so a 2.5s window read live-but-slow
+ * upstreams as dead and returned 502 (`stale pooled socket (no response
+ * headers)`) whenever the retry also landed on a pooled socket. The OS-level
+ * RST (~6s) already catches genuinely reaped sockets, so this is a backstop now.
  */
-const POOLED_HEADER_TIMEOUT_MS = numEnv('POOLED_HEADER_TIMEOUT_MS', 2_500)
+const POOLED_HEADER_TIMEOUT_MS = numEnv('POOLED_HEADER_TIMEOUT_MS', 10_000)
 /** Minimum spacing between health snapshot writes (requests use the throttle). */
 const STATUS_WRITE_INTERVAL_MS = numEnv('STATUS_WRITE_INTERVAL_MS', 60_000)
 
@@ -490,6 +496,14 @@ const upstreamAgent = new https.Agent({
 })
 
 /**
+ * Escape hatch for the stale-socket retry: `keepAlive:false` guarantees a brand
+ * new socket, so the attempt starts from `socket.connecting` and is never
+ * itself subject to POOLED_HEADER_TIMEOUT_MS. Without it a single slow upstream
+ * header phase could kill two pooled attempts in a row and surface a 502.
+ */
+const freshAgent = new https.Agent({ keepAlive: false, maxSockets: 64 })
+
+/**
  * DNS cache for upstream requests. net.connect's default lookup hits the OS
  * resolver on every *new* socket, and sockets rotate whenever the peer reaps
  * an idle connection — so a fresh connection paid DNS+TCP+TLS. Caching the
@@ -584,7 +598,7 @@ async function zenFetch(
     const stale = code === 'ECONNRESET' || code === 'EPIPE' || code === 'UND_ERR_SOCKET' || /socket hang up/i.test(String((err as Error).message))
     if (!stale) throw err
     console.warn(`[upstream] stale pooled socket (${code ?? 'hang up'}), retrying once on a fresh connection`)
-    response = await zenFetchOnce(url, upstreamBody, messages, signal, attempt)
+    response = await zenFetchOnce(url, upstreamBody, messages, signal, attempt, freshAgent)
   }
   // Credential failover: the 429/401 above already put that key in cooldown,
   // so the retry walks to the next ready key (or the anonymous lane). One
@@ -607,6 +621,7 @@ async function zenFetchOnce(
   messages: unknown,
   signal: AbortSignal,
   attempt: { entry: PoolEntry | null },
+  agent: https.Agent = upstreamAgent,
 ): Promise<UpstreamResponse> {
   const ids = deriveRequestIDs(
     Array.isArray(messages) ? (messages as Array<{ role: string; content: unknown }>) : [],
@@ -648,7 +663,7 @@ async function zenFetchOnce(
         hostname: target.hostname,
         path: `${target.pathname}${target.search}`,
         method: 'POST',
-        agent: upstreamAgent,
+        agent,
         lookup: cachedLookup,
         headers: headerBag,
       },
@@ -1647,6 +1662,7 @@ function shutdown(signal: string): void {
   const force = setTimeout(() => {
     server.closeAllConnections?.()
     upstreamAgent.destroy()
+    freshAgent.destroy()
     process.exit(0)
   }, SHUTDOWN_DRAIN_MS)
   force.unref()
