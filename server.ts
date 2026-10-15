@@ -1393,6 +1393,41 @@ function chatText(content: unknown): string {
 }
 
 /**
+ * Chat content -> Responses input content, preserving images. Text-only
+ * content stays a plain string (compact, exactly as before); any image part
+ * produces the parts array with `input_text` / `input_image` items. Without
+ * this the bridge flattened images to '' and the model never saw them
+ * (live 2026-10-15: muse-spark-1.3 via render "sent but blind").
+ */
+function chatContentToResponses(content: unknown): string | Array<Record<string, unknown>> {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  let hasImage = false
+  const parts: Array<Record<string, unknown>> = []
+  for (const raw of content) {
+    const part = (raw ?? {}) as Record<string, unknown>
+    if (typeof part.text === 'string' && (part.type === 'text' || part.type === undefined)) {
+      if (part.text) parts.push({ type: 'input_text', text: part.text })
+      continue
+    }
+    if (part.type === 'image_url') {
+      const imageUrl = part.image_url as Record<string, unknown> | string | undefined
+      const url = typeof imageUrl === 'string' ? imageUrl : typeof imageUrl?.url === 'string' ? imageUrl.url : ''
+      if (!url) continue
+      hasImage = true
+      const detail = typeof imageUrl === 'object' && imageUrl !== null && typeof imageUrl.detail === 'string' ? imageUrl.detail : 'auto'
+      parts.push({ type: 'input_image', image_url: url, detail })
+      continue
+    }
+    if (typeof part.text === 'string' && part.text) {
+      parts.push({ type: 'input_text', text: part.text })
+    }
+  }
+  if (!hasImage) return parts.map((p) => (typeof p.text === 'string' ? p.text : '')).join('')
+  return parts
+}
+
+/**
  * Chat Completions request -> Responses request. Every field with a Responses
  * spelling is translated: system/developer turns become `instructions`,
  * assistant tool calls and tool results become `function_call` /
@@ -1422,8 +1457,10 @@ function chatRequestToResponsesBody(clientBody: Record<string, unknown>): Record
       continue
     }
     if (role === 'assistant') {
-      const text = chatText(message.content)
-      if (text) input.push({ role: 'assistant', content: text })
+      const content = chatContentToResponses(message.content)
+      if (content !== '' && !(Array.isArray(content) && content.length === 0)) {
+        input.push({ role: 'assistant', content })
+      }
       if (Array.isArray(message.tool_calls)) {
         for (const raw of message.tool_calls as Array<Record<string, unknown>>) {
           const fn = (raw.function ?? {}) as Record<string, unknown>
@@ -1438,7 +1475,7 @@ function chatRequestToResponsesBody(clientBody: Record<string, unknown>): Record
       }
       continue
     }
-    input.push({ role, content: chatText(message.content) })
+    input.push({ role, content: chatContentToResponses(message.content) })
   }
 
   const tools = Array.isArray(clientBody.tools)
