@@ -4,44 +4,44 @@ import { dirname, join } from 'node:path'
 import { opencodeUserAgent } from './ids.ts'
 
 /**
- * Port of agent/internal/catalog (opencode2api models.go + model_metadata.go,
- * trimmed to the single anonymous Zen lane) plus the S3 static fallback:
+ * Live model directory with a persisted snapshot and dynamic dead-model
+ * suppression (no compiled-in model lists — the project judges, nobody
+ * prescribes):
  *
- *   S1  GET {zen}/v1/models            live catalog (in-sale ids, free or paid)
- *   S2  GET https://models.dev/api.json  pricing metadata -> free decision
- *   S3  compile-time verified ids       last-resort bootstrap list
+ *   S1  GET {zen}/v1/models               live catalog (in-sale ids, free or paid)
+ *   S2  GET https://models.dev/api.json   pricing metadata -> free decision
+ *   S3  last-known-good snapshot on disk  bootstrap while S1 is pending
+ *   S4  probed bans (persisted, expiring) models whose own calls failed dead
  *
- * /v1/models-equivalent exposure = S1 ∩ S2-allowed (or S3 while S1 is pending).
+ * /v1/models-equivalent exposure = S1 ∩ S2-allowed − S4-banned
+ * (or S3 ∩ S2-allowed − S4-banned while S1 is pending).
+ *
+ * A model lands in S4 only when one of ITS OWN calls answers dead
+ * (404, or 400 naming the model unavailable/unsupported/missing — never
+ * 401/403/429/5xx, which are credential/gate/quota/capacity and say nothing
+ * about the model). Bans back off exponentially and expire, so a revived
+ * model returns by itself; any 2xx call clears the ban immediately.
  */
 
 export const ZEN_BASE_URL = 'https://opencode.ai/zen'
 
-/** Live-verified 200 on 2026-10-15 (st_ lane, new gate): the current S1 free roster. */
-export const staticFreeModels: string[] = [
-  'mimo-v2.6-flash-free', // verified 2026-10-15: chat 200 (stream + non-stream, st_ lane)
-  'cat-jam-free', // S1 2026-10-15; region-blocked from CN exits (RegionError = gate passed)
-  'jev-1.13-free', // S1 2026-10-15
-  'step-5-preview-free', // S1 2026-10-15
-  'longcat-2.5-preview-free', // S1 2026-10-15
-  'space-bunny-free', // S1 2026-10-15
-  'nemotron-3.5-lightning-free', // S1 2026-10-15
-  'muse-spark-1.2-contributor-free', // models.dev deprecated but S1-listed; static vouch kept
-  'muse-spark-1.3-contributor-free', // S1 2026-10-15 (Responses-only)
-]
-// S1-listed but call-dead upstream (calling answers 400/401/500 regardless of
-// gate shape). Hidden from the live list AND the S3 fallback with a dedicated
-// source so diagnostics distinguish "upstream delisted" from "we hide it".
-// Re-check occasionally: if upstream revives one, delete its line.
-export const staticDeadModels: string[] = [
-  'big-pickle', // S1-listed 2026-10-15 but chat answers 400
-]
+/** First ban length; doubles per consecutive dead call, capped below. */
+export const MODEL_BAN_BASE_MS = 6 * 60 * 60 * 1000
+/** Upper bound for the ban backoff (a permanently dead model re-probes weekly). */
+export const MODEL_BAN_MAX_MS = 7 * 24 * 60 * 60 * 1000
+/** Snapshots older than this are ignored (stale booths must not fossilise). */
+export const SNAPSHOT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 
-/** Exposed by /v1/models but without a verified anonymous chat yet. */
-export const staticFreeCandidates: string[] = [
-  // 'deepseek-v4-flash-free',          // models.dev deprecated; 2026-09-01: upstream 400 "Model is unavailable"
-  // 'laguna-s-2.1-free',                // models.dev deprecated; 2026-09-01: upstream 503 (intermittent, failed twice)
-  // 'hy3-free',                        // models.dev deprecated; 2026-09-01: delisted from /v1/models, upstream 401 "not supported"
-]
+/**
+ * Whether an upstream answer proves the MODEL (not the credential, gate,
+ * quota or capacity) is dead. Callers pass the upstream HTTP status and the
+ * raw body text of a failed call for exactly one model id.
+ */
+export function isModelDeadSignal(status: number, text: string): boolean {
+  if (status === 404) return true
+  if (status !== 400) return false
+  return /model.{0,60}(unavailable|not supported|not[ -]?supported|not found|does not exist)|no .{0,40}(endpoints|route)|model_not_found|invalid model|unsupported model/i.test(text)
+}
 
 export function isFreeModel(model: string): boolean {
   return model.toLowerCase().includes('free')
@@ -224,6 +224,14 @@ export interface CatalogOptions {
   authorization?: string | (() => string | string[])
   /** Where the models.dev cache lives (agent data dir). */
   cachePath?: string
+  /**
+   * Where the last-known-good S1 snapshot + probed bans live. Defaults to
+   * `<dirname(cachePath)>/catalog-snapshot.json` when a cachePath is set;
+   * unset disables persistence (tests). The snapshot is what the picker
+   * shows while S1 is still pending — yesterday's live list, not a
+   * compile-time prescription.
+   */
+  snapshotPath?: string | null
   /** Upstream override for tests. */
   zenBaseUrl?: string
   /** models.dev override for tests. */
@@ -240,24 +248,28 @@ const METADATA_REFRESH_MS = 24 * 60 * 60 * 1000
 const FETCH_TIMEOUT_MS = 30_000
 
 /**
- * Live model directory with the S1/S2/S3 fallback chain and the timer-driven
- * refresh loop. All state is in-memory; only the models.dev cache persists.
+ * Live model directory with the S1/S2/snapshot/ban chain and the timer-driven
+ * refresh loop. Only the models.dev cache and the snapshot/bans file persist.
  *
- * Decision chain (design.md 4.1/4.2, with the deprecation-first fix):
- *   1. ready metadata verdict — deprecated/paid deny, free cost allows; a
- *      "free" name never overrides a negative metadata verdict
- *   2. metadata cannot speak (pending/missing) — name fallback, or the
- *      compile-time verified S3 list for known-good ids
+ * Decision chain: probed bans first, then the ready metadata verdict
+ * (deprecated/paid deny, free cost allows); a "free" name never overrides a
+ * negative metadata verdict, and the name fallback only fires when metadata
+ * cannot speak (pending/missing) — its original documented intent.
  */
 export class ModelCatalog {
   #zen: Set<string> = new Set()
   #updatedAt = 0
   #prices: Map<string, ModelPrice> = new Map()
   #pricesReady = false
+  /** Last-known-good S1 ids, loaded from disk at start (S3 bootstrap). */
+  #snapshotIds: string[] = []
+  /** Active probed bans: model -> {ban ends at, consecutive dead calls}. */
+  #bans = new Map<string, { until: number; consecutive: number }>()
   #lastError = ''
   #refreshSeconds: number
   #authorization: string | (() => string | string[])
   #cachePath?: string
+  #snapshotPath?: string | null
   #zenBaseUrl: string
   #metadataUrl: string
   #fetch: typeof fetch
@@ -271,6 +283,12 @@ export class ModelCatalog {
     this.#refreshSeconds = options.refreshSeconds ?? 300
     this.#authorization = options.authorization ?? 'Bearer public'
     this.#cachePath = options.cachePath
+    this.#snapshotPath =
+      options.snapshotPath === undefined
+        ? options.cachePath === undefined
+          ? undefined
+          : join(dirname(options.cachePath), 'catalog-snapshot.json')
+        : (options.snapshotPath ?? undefined)
     this.#zenBaseUrl = options.zenBaseUrl ?? ZEN_BASE_URL
     this.#metadataUrl = options.metadataUrl ?? 'https://models.dev/api.json'
     this.#fetch = options.fetchImpl ?? fetch
@@ -285,6 +303,7 @@ export class ModelCatalog {
    * coming up — VPN/TUN reconnect, DNS), then the normal cadence (S2 24h).
    */
   async start(): Promise<void> {
+    await this.#loadPersisted()
     await this.refreshOnce()
     let attempts = 0
     while (this.#zen.size === 0 && attempts < 4 && !this.#stopped) {
@@ -342,6 +361,7 @@ export class ModelCatalog {
       this.#zen = union
       this.#updatedAt = this.#now()
       this.#lastError = ''
+      await this.#savePersisted()
     } catch (err) {
       this.#lastError = err instanceof Error ? err.message : String(err)
     }
@@ -372,34 +392,111 @@ export class ModelCatalog {
   }
 
   decision(model: string): AnonymousDecision {
-    // Call-dead ids are hidden first: upstream lists them but every call fails,
-    // so exposing them only produces confusing 400s in clients.
-    if (staticDeadModels.includes(model)) {
-      return { allowed: false, source: 'upstream_call_dead', known: true }
+    // S4 probed ban: one of this model's own calls already proved it dead.
+    // Expired bans evaporate here so revived models return without a restart.
+    const ban = this.#bans.get(model)
+    if (ban !== undefined) {
+      if (ban.until > this.#now()) {
+        return { allowed: false, source: 'probed_dead', known: true }
+      }
+      this.#bans.delete(model)
     }
     const metadata = decide(model, this.#prices, this.#pricesReady)
-    // The S3 vouch only covers ids metadata cannot speak for. A metadata
-    // verdict of deprecated is Known, but S3 entries are compile-time verified
-    // against the live lane, so an S3 id stays vouched even when stale
-    // metadata claims deprecation (hy3-free case: works after models.dev
-    // flags it, dies only when it leaves the Zen catalog).
-    if (!metadata.allowed && metadata.source === 'metadata_deprecated' && staticFreeModels.includes(model)) {
-      return { allowed: true, source: 'static_verified', known: false }
-    }
-    if (!metadata.allowed && !metadata.known && staticFreeModels.includes(model)) {
-      return { allowed: true, source: 'static_verified', known: false }
-    }
+    // A ready metadata verdict always wins; the name fallback only fires when
+    // metadata cannot speak (pending or model missing) — its original
+    // documented intent (design.md 4.2). Nobody vouches by name anymore:
+    // deprecated stays hidden, delisted stays hidden, dead stays banned.
     return metadata
   }
 
-  /** ids exposed to DSH: S1 ∩ allowed, or S3 while the live catalog is pending. */
+  /** ids exposed to DSH: S1 ∩ allowed − banned, or the persisted snapshot while S1 is pending. */
   list(): string[] {
-    if (this.#zen.size === 0) return [...staticFreeModels]
+    const source = this.#zen.size === 0 ? this.#snapshotIds : [...this.#zen]
     const out: string[] = []
-    for (const model of this.#zen) {
+    for (const model of source) {
       if (this.decision(model).allowed) out.push(model)
     }
-    return out.sort()
+    return [...new Set(out)].sort()
+  }
+
+  /**
+   * Record that one call for `model` answered dead (see isModelDeadSignal).
+   * The ban starts at 6h and doubles per consecutive dead call (7d cap); any
+   * success clears it via reportModelUsable. Expired bans lift themselves.
+   */
+  reportModelUnusable(model: string): void {
+    if (!model) return
+    const previous = this.#bans.get(model)
+    const consecutive = (previous?.consecutive ?? 0) + 1
+    const length = Math.min(MODEL_BAN_BASE_MS * 2 ** (consecutive - 1), MODEL_BAN_MAX_MS)
+    this.#bans.set(model, { until: this.#now() + length, consecutive })
+    void this.#savePersisted()
+  }
+
+  /** A 2xx answer for `model` lifts any probed ban immediately. */
+  reportModelUsable(model: string): void {
+    if (!model || !this.#bans.has(model)) return
+    this.#bans.delete(model)
+    void this.#savePersisted()
+  }
+
+  /** Currently banned ids (unexpired), for diagnostics. */
+  bannedModels(): string[] {
+    const now = this.#now()
+    return [...this.#bans.entries()].filter(([, ban]) => ban.until > now).map(([model]) => model).sort()
+  }
+
+  /** Load the persisted snapshot + bans (start() only; never throws). */
+  async #loadPersisted(): Promise<void> {
+    if (!this.#snapshotPath) return
+    try {
+      const raw = JSON.parse(await readFile(this.#snapshotPath, 'utf8')) as {
+        updatedAt?: unknown
+        ids?: unknown
+        bans?: unknown
+      }
+      const now = this.#now()
+      if (typeof raw.updatedAt === 'number' && now - raw.updatedAt <= SNAPSHOT_MAX_AGE_MS && Array.isArray(raw.ids)) {
+        this.#snapshotIds = raw.ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+      }
+      if (raw.bans !== null && typeof raw.bans === 'object' && !Array.isArray(raw.bans)) {
+        for (const [model, ban] of Object.entries(raw.bans as Record<string, unknown>)) {
+          const record = ban as { until?: unknown; consecutive?: unknown }
+          if (typeof record?.until === 'number' && record.until > now) {
+            this.#bans.set(model, {
+              until: record.until,
+              consecutive: typeof record.consecutive === 'number' && record.consecutive > 0 ? Math.floor(record.consecutive) : 1,
+            })
+          }
+        }
+      }
+    } catch {
+      // a missing/corrupt snapshot is not fatal: S1 fills in shortly
+    }
+  }
+
+  /** Persist the snapshot + bans (best effort; never throws into callers). */
+  async #savePersisted(): Promise<void> {
+    if (!this.#snapshotPath) return
+    try {
+      const now = this.#now()
+      const bans: Record<string, { until: number; consecutive: number }> = {}
+      for (const [model, ban] of this.#bans) {
+        if (ban.until > now) bans[model] = ban
+      }
+      const payload = {
+        updatedAt: this.#zen.size > 0 ? this.#updatedAt : now,
+        ids: this.#zen.size > 0 ? [...this.#zen] : this.#snapshotIds,
+        bans,
+      }
+      await mkdir(dirname(this.#snapshotPath), { recursive: true })
+      const tmp = `${this.#snapshotPath}.${process.pid}.tmp`
+      await writeFile(tmp, JSON.stringify(payload), 'utf8')
+      await rm(this.#snapshotPath, { force: true })
+      await rename(tmp, this.#snapshotPath)
+    } catch {
+      // persistence is advisory; the live catalog is authoritative
+    }
   }
 
   /**

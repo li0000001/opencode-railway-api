@@ -31,7 +31,7 @@ import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { ModelCatalog, ZEN_BASE_URL, type CatalogSnapshot } from './adapter/catalog.ts'
+import { ModelCatalog, isModelDeadSignal, ZEN_BASE_URL, type CatalogSnapshot } from './adapter/catalog.ts'
 import { deriveRequestIDs, disguiseHeaders } from './adapter/ids.ts'
 import { ensureFreeLaneShape, ensureResponsesFreeLaneShape } from './adapter/messages.ts'
 import { isResponsesModel } from './adapter/routing.ts'
@@ -841,10 +841,13 @@ function describeUpstreamError(
 /**
  * Upstream failure → the client. OpenAI-shaped error bodies pass through
  * untouched (now with retry-after / x-request-id preserved); anything else is
- * wrapped so clients always see a valid error.
+ * wrapped so clients always see a valid error. A dead-model signal additionally
+ * records a probed ban in the catalog (self-healing roster); successes clear
+ * bans at their own call sites.
  */
-async function relayUpstreamError(upstream: UpstreamResponse, res: ServerResponse): Promise<void> {
+async function relayUpstreamError(upstream: UpstreamResponse, res: ServerResponse, model: string): Promise<void> {
   const text = await upstream.text().catch(() => '')
+  if (model && isModelDeadSignal(upstream.status, text)) catalog.reportModelUnusable(model)
   const { payload, message } = describeUpstreamError(upstream, text)
   stats.lastUpstreamError = message
   sendJson(res, upstream.status, payload, pickUpstreamHeaders(upstream))
@@ -1348,10 +1351,11 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse): 
         emitSseError(res, described.message, described.type)
         return
       }
-      await relayUpstreamError(upstream, res)
+      await relayUpstreamError(upstream, res, model)
       return
     }
     stats.lastUpstreamError = ''
+    catalog.reportModelUsable(model)
     if (wantsStream) {
       await relayStream(upstream, res, controller, earlyHead)
       return
@@ -1936,10 +1940,11 @@ async function handleChatViaResponses(
         emitSseError(res, described.message, described.type)
         return
       }
-      await relayUpstreamError(upstream, res)
+      await relayUpstreamError(upstream, res, model)
       return
     }
     stats.lastUpstreamError = ''
+    catalog.reportModelUsable(model)
     if (wantsStream) {
       await relayResponsesAsChatStream(upstream, res, controller, model, earlyHead)
       return
@@ -2057,10 +2062,11 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse): Promi
         emitSseError(res, described.message, described.type)
         return
       }
-      await relayUpstreamError(upstream, res)
+      await relayUpstreamError(upstream, res, model)
       return
     }
     stats.lastUpstreamError = ''
+    catalog.reportModelUsable(model)
     if (wantsStream) {
       await relayStream(upstream, res, controller, earlyHead)
       return
