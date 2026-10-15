@@ -1,14 +1,15 @@
 # opencode2dsh Railway Server
 
-一个**零依赖**的 OpenAI 兼容网关，把 OpenCode Zen 的匿名免费通道暴露为标准
+一个**零依赖**的 OpenAI 兼容网关，把 OpenCode Zen 的免费通道暴露为标准
 `/v1/*` 端点，可部署到 [Railway](https://railway.app)，供 OpenWebUI、Cherry
 Studio 或任何支持 `base_url + API key` 的客户端调用。
 
-> **默认不需要任何上游 key。** 不设置 `ZEN_API_KEY` / `ZEN_API_KEYS` 即走匿名
-> 免费通道（上游凭证是 `Authorization: Bearer public`）。`API_KEY` 只是**调用方**
-> 访问本服务用的密钥，和 OpenCode 账号无关；想改用自己 Zen 账户的配额时再填
-> `ZEN_API_KEY`。详见下方[本地补丁](#本地补丁2026-10-13必须保留)——不打补丁时
-> 匿名通道会**每个请求都 403**。
+> **需要一个上游凭证：`ZEN_ACCESS_TOKEN`（OpenCode 账号的 OAuth token，`st_…`，
+> 约 30 天过期）。** 匿名通道（`Bearer public`）自 2026-10-14 起对免费模型
+> 全部 `403 FreeTierError`，`oc_sk_…` Zen API key 调免费模型回 403（只可用于
+> 付费模型）。`API_KEY` 只是**调用方**访问本服务用的密钥，和 OpenCode 账号
+> 无关。取 token：`node ../../scripts/get-zen-token.mjs`（仓库根 `docs/`
+> 有完整运维手册 `zen-free-lane-ops.md`）。
 
 服务端直接复用插件里已实测验证的适配层源码（`packages/plugin/src/adapter/`）：
 
@@ -39,7 +40,20 @@ Studio 或任何支持 `base_url + API key` 的客户端调用。
 > 因此默认列出也不会坏。它们以前在你本地不可见还有第二层原因：受限国家请求它们
 > 会拿到 `403 RegionError`；服务搬到美国后该限制消失。
 
-## 本地补丁（2026-10-13，必须保留）
+## 门禁现状（2026-10-15 实测，二分验证）
+
+免费模型请求必须同时满足以下全部，缺一即 `403 FreeTierError`（`RegionError`
+除外——那是门禁已过、出口国家被限，反而证明指纹正确）：
+
+1. `Authorization: Bearer st_…`（`ZEN_ACCESS_TOKEN`）；
+2. `User-Agent: opencode/latest/<semver>/cli`（当前 `2.0.29`，`ZEN_CLIENT_VERSION` 可覆盖）；
+3. `x-opencode-session` 与 `x-opencode-session-id` 同值（`ses_` + 9位hex + `ffe` + 14位base62），另带 `x-session-affinity` / `X-Session-Id`；
+4. `x-opencode-project: global`（`prj_*` 会 403）；
+5. **不发** `x-opencode-request`（网关自有 tracing 头，出现即 403）；
+6. body 带官方原版 `read` + `shell` 工具声明（逐字一致，见 `adapter/messages.ts`
+   `GATE_TOOL_BODIES`），`tool_choice: auto`，`stream: true`。
+
+## 本地补丁（2026-10-13 起，必须保留）
 
 本目录从插件源码拷来的 `adapter/` 与 `server.ts` 各带一处**本地修正**。上游免费
 通道的门禁在 2026-10 收紧过，**未打补丁时每个请求都会 403 `FreeTierError`**
@@ -98,11 +112,17 @@ Studio 或任何支持 `base_url + API key` 的客户端调用。
 - 转换后的 body 仍要过 `ensureResponsesFreeLaneShape`，所以 `ffe`、伪装头、
   `stream:true`、`bash`+`read` 四条门禁照旧由既有逻辑保证，桥接不碰门禁。
 
-本机验证（受限国家 + 匿名通道）：`/v1/models` → 11 个（9 个 chat + 2 个
-responses）；在 chat 接口请求 `muse-spark-1.2-contributor-free` 能通过门禁直达
-上游，只被国家限制拦回 `RegionError`（**不是** `FreeTierError` 或 400，说明请求
-形状正确）；同一时刻 `big-pickle` 仍正常 200。转换逻辑另有 33 条离线单测
+本机验证（`st_…` 通道）：`/v1/models` → 上游 44 个模型中 9–10 个免费；
+在 chat 接口请求 `mimo-v2.6-flash-free`（`stream:false` 与流式）均 200。
+转换逻辑另有 33 条离线单测
 （请求翻译、流式增量、工具调用、无增量兜底、错误映射、非流式聚合）全绿。
+
+### 4. `adapter/ids.ts` + `server.ts` — 2026-10-15：请求头指纹对齐官方客户端
+
+对照官方客户端源码（`opencode` v2.0.29 `model-request.ts`）+ 在线二分：
+`x-opencode-request` 一出现即 403（同请求去头即 200），`x-opencode-project`
+发字面 `global`（官方非 git 目录行为；`prj_*` 403），多余的 `x-session-id`
+去掉，UA 跟进 `2.0.29`。`RequestIDs.request` 保留只做本地日志，不再上送。
 
 ## 环境变量
 
@@ -122,24 +142,29 @@ responses）；在 chat 接口请求 `muse-spark-1.2-contributor-free` 能通过
 | `POOL_WARM_INTERVAL_MS` | 否 | `20000` | 上游连接池保活心跳间隔（见下）。小于对端空闲回收时间，避免空闲后复用「半死」连接 |
 | `POOLED_HEADER_TIMEOUT_MS` | 否 | `10000` | **复用连接看门狗**：仅针对从池里复用的 keep-alive 连接，若该窗口内没收到上游响应头就判为半开失效，换新连接重试一次（新连接不受此限，它本来就要付 DNS+TCP+TLS）。原默认 `2500` 低于上游实际响应头耗时（实测 2.6–9.7s），会误杀正常连接并 502，故放宽——真死连接由 OS 的 ~6s RST 兜底 |
 | `DNS_TTL_MS` | 否 | `60000` | 上游 DNS 结果缓存时长；解析失败时回退到过期缓存 |
-| `ZEN_API_KEY` | 否 | —（空 = 匿名免费通道） | **上游凭证**。留空就是 `Bearer public` 匿名免费通道；填入 [OpenCode Zen](https://opencode.ai/zen) 的 API key 后，对话与 Responses 都改用你的 key。key 不写日志、不被任何接口回显 |
+| `ZEN_ACCESS_TOKEN` | **是（免费模型）** | — | **上游凭证**：OpenCode 账号 OAuth token（`st_…`，约 30 天过期）。免费模型只认它。取法见仓库根 `docs/zen-free-lane-ops.md` 第 3 节。key 不写日志、不被任何接口回显（`/health` 只报 `st_***` 掩码） |
+| `ZEN_SESSION_TOKEN` | 否 | — | `ZEN_ACCESS_TOKEN` 的别名 |
+| `ZEN_CLIENT_VERSION` | 否 | `2.0.29` | 伪装 UA 里的官方客户端版本号，跟随 OpenCode 发版改即可 |
+| `ZEN_API_KEY` | 否（只用于付费模型） | —（空） | Zen API key（`oc_sk_…`）：调免费模型回 403，只可用于付费模型 |
 | `ZEN_API_KEYS` | 否 | — | **key 池**：逗号 / 分号 / 空白分隔多个 key（与 `ZEN_API_KEY` 同时设置会合并）。多于 1 个即启用池化行为，见下节 |
 | `KEY_COOLDOWN_MS` | 否 | `60000` | key 撞 429/401 后的冷却基准时长；按连续失败次数指数递增（60s→120s→240s…），上限 10 分钟 |
-| `KEY_POOL_ANONYMOUS` | 否 | `true` | 所有 key 都在冷却时，是否回退到匿名免费通道（它按出口 IP 计量，是另一份配额） |
+| `KEY_POOL_ANONYMOUS` | 否 | 无 `st_…` 时 `true`，有则 `false` | 所有凭证都在冷却时，是否回退到匿名通道。匿名对免费模型已全 403，配了 `st_…` 时默认关闭，避免把真实错误换成误导性错误 |
 | `KEY_POOL_FAILOVER` | 否 | `true` | 某个 key 回 429/401 时，是否在**同一次请求内**改用下一个就绪 key 重试一次（仅池模式生效；匿名单通道的 429 依旧原样透传） |
 
-## 上游两种通道与 key 池（`ZEN_API_KEY` / `ZEN_API_KEYS`）
+## 上游凭证与 key 池（`ZEN_ACCESS_TOKEN` / `ZEN_API_KEY(S)`）
 
-一个变量切换，其余行为完全一致（伪装头、free-lane 形状门禁、目录过滤都保留）：
+免费模型只认 `ZEN_ACCESS_TOKEN`（`st_…`）。`oc_sk_…` 只用于付费模型；
+匿名（什么都不填）对免费模型全 403，`/health` 会明确提示。其余行为完全一致
+（伪装头、free-lane 形状门禁、目录过滤都保留）：
 
-| | key 留空（默认） | 配置 1 个 key | 配置 ≥2 个 key（池） |
+| | 只配 `ZEN_ACCESS_TOKEN`（正常形态） | 追加 `oc_sk_…`（仅付费模型） | 配置 ≥2 个凭证（池） |
 | --- | --- | --- | --- |
-| 凭证 | `Authorization: Bearer public` | `Authorization: Bearer <你的key>` | 每次请求按粘滞规则取一个 key |
+| 凭证 | `Authorization: Bearer st_…` | 免费模型仍走 `st_…`；付费模型可用 key | 每次请求按粘滞规则取一个凭证 |
 | base URL | `https://opencode.ai/zen/v1` | 同一个 | 同一个 |
-| 暴露的模型 | 十余个 `*-free` | **同样十余个 `*-free`**（目录仍只放行免费模型；要放开付费模型需要再加开关） | 同左 |
-| 配额来源 | 出口 IP 的匿名额度（实测约 450–766 请求/天，UTC 00:00 重置，另有约 250 请求/小时的短时限速） | 你 Zen 账户的限额 | 各 key 的限额相加 |
-| 启动日志 | `upstream auth: anonymous free lane` | `upstream auth: zen-key (1 key: oc_sk_…)` | `upstream auth: zen-key-pool (N keys: oc_sk_…, …)` + 池参数行 |
-| `/health` | `"upstreamAuth": "anonymous"` | `"upstreamAuth": "zen-key"` | `"upstreamAuth": "zen-key-pool"` + `pool` 块 |
+| 暴露的模型 | 9–10 个 `*-free`（目录仍只放行免费模型；要放开付费模型需要再加开关） | 同左 | 同左 |
+| 配额来源 | `st_…` 背后账号的免费额度（约 30 天轮换 token，见运维手册第 6 节） | 你 Zen 账户的付费限额 | 各凭证的限额相加 |
+| 启动日志 | `upstream auth: zen-session (1 credential: st_***)` | `upstream auth: zen-key …` + 免费模型需 `st_…` 的提示行 | `upstream auth: zen-key-pool (N …)` + 池参数行 |
+| `/health` | `"upstreamAuth": "zen-session"` | `"upstreamAuth": "zen-key"` | `"upstreamAuth": "zen-key-pool"` + `pool` 块 |
 
 ### key 池怎么工作
 
@@ -152,7 +177,7 @@ railway variables set ZEN_API_KEYS="key1,key2,key3,key4"
 | **会话粘滞** | `sha256(会话种子)` 选首选 key，冷却中则顺延到下一个就绪 key。同一对话全程固定一把 key（上游 prompt 缓存亲和稳定），只有首选 key 进冷却才漂移 |
 | **冷却熔断** | key 回 **429**（读 `retry-after`）或 **401** → 冷却 60s 起、指数递增到 10 分钟上限。403（free-tier 门禁）与 5xx（上游容量）**不算** key 的错，不冷却，避免白白缩小池子 |
 | **请求内故障转移** | 池模式下 429/401 会立刻在**同一次请求**里改用下一个就绪 key 重试一次，客户端只看到 200（实测：混入 1 个坏 key，11/11 请求全部 200，坏 key 三次 401 后被指数冷却到 4 分钟） |
-| **匿名兜底** | 所有 key 都在冷却 → 回退 `Bearer public`（出口 IP 是另一份配额）；`KEY_POOL_ANONYMOUS=false` 可关 |
+| **匿名兜底** | 所有凭证都在冷却 → 回退 `Bearer public`（仅 `KEY_POOL_ANONYMOUS=true` 时；匿名对免费模型已 403，一般保持默认关闭） |
 | **模型列表身份** | 每次刷新都取「匿名公开列表 ∪ 一个就绪 key 的账户列表」再过滤出免费模型。单用 key 会漏掉 `nemotron-3-ultra-free`（实测 key 能调通它），单用匿名则列表里可能混入上游已无路由的条目 |
 | **可观测** | `/health` 与 `STATUS_PATH` 快照里的 `pool` 块：每把 key 的掩码指纹、`ready`、`cooldownSeconds`、`used`、`rejected`、`lastStatus` |
 
@@ -172,20 +197,20 @@ railway variables set ZEN_API_KEYS="key1,key2,key3,key4"
 **掩码规则**：`fingerprint` = key 前 16 字符 + `...` + 后 4 字符（不含密钥主体），
 日志、`/health`、状态文件里出现的**永远只有掩码形式**。
 
-拿到 key：登录 [opencode.ai/zen](https://opencode.ai/zen) → 绑卡充值（最低 $20，另有 4.4%+$0.30 卡费）→ 复制 API key。
+拿到付费 key（仅付费模型用）：登录 [opencode.ai/zen](https://opencode.ai/zen) → 绑卡充值（最低 $20，另有 4.4%+$0.30 卡费）→ 复制 API key。
 
 ```sh
-railway variables set ZEN_API_KEY=<你的Zen key>    # 单 key
-railway variables set ZEN_API_KEYS=<key1>,<key2>   # 池
+railway variables set ZEN_API_KEY=<你的Zen key>    # 单 key（付费模型）
+railway variables set ZEN_API_KEYS=<key1>,<key2>   # 池（付费模型）
 # 清除：railway variables unset ZEN_API_KEY
 ```
 
 **两点提醒**
 
-1. **`-free` 模型是"限时免费"档**：社区报告过"有余额仍撞 `FreeUsageLimitError`"
-   （[anomalyco/opencode#33318](https://github.com/anomalyco/opencode/issues/33318)），
-   即免费模型的 IP/日限额**不一定**随 key 解除。上游返回 401/429 时，错误文案里会
-   明确标注是 `ZEN_API_KEY` 被拒还是匿名通道限流，便于判断。
+1. **`-free` 模型只认 `st_…`**：`oc_sk_…` 调免费模型回 403 `Workspace access denied`；
+   社区另报告过"有余额仍撞 `FreeUsageLimitError`"
+   （[anomalyco/opencode#33318](https://github.com/anomalyco/opencode/issues/33318)）。
+   上游返回 401/429 时，错误文案里会明确标注是凭证被拒还是通道限流，便于判断。
 2. **key 只放 Railway 的 Variables**，不要提交进仓库；下游客户端用的仍是自己的
    `API_KEY`，两者互不相干。上游 key 不会出现在日志、`/health` 或任何响应里。
 
@@ -200,12 +225,12 @@ railway variables set ZEN_API_KEYS=<key1>,<key2>   # 池
    `railway.json`、`package.json`、`server.ts`、`README.md`、`adapter/`）放进去。
 2. Railway → **New Project → Deploy from GitHub repo**，选择该仓库。
    本目录的 `railway.json` 会自动选用 `Dockerfile` 构建。
-3. **Settings → Variables** 添加 `API_KEY`（自生成一个强随机串）。
-   **不要设置 `ZEN_API_KEY` / `ZEN_API_KEYS`**——留空就是匿名免费通道（本次改动
-   的目标形态）；填了会把请求切到你 Zen 账户的配额。上游策略收紧时再填它们作为
-   备用，代码路径一直都在。
+3. **Settings → Variables** 添加 `API_KEY`（自生成一个强随机串）和
+   `ZEN_ACCESS_TOKEN`（`st_…`，必填，见上）。**不要再指望匿名通道**——留空
+   `ZEN_ACCESS_TOKEN` 就是全 403（本次改动的目标形态是 `st_…` 通道）。
 4. **Settings → Networking → Generate Domain** 生成公网域名。
-5. 部署完成后访问 `https://<你的域名>/health` 验证。
+5. 部署完成后访问 `https://<你的域名>/health` 验证：`upstreamAuth` 应为
+   `zen-session`（不是 `anonymous`），`catalog.exposed` 约 10。
 
 方式 B —— Railway CLI（在**本目录内**执行）：
 
@@ -217,28 +242,26 @@ railway variables set API_KEY=<你的强随机密钥>
 railway domain    # 生成公网域名
 ```
 
-匿名免费模式（默认）**不需要**再设置 `ZEN_API_*`。若之后想用自己 Zen 账户的配额：
+匿名免费模式已于 2026-10-14 关闭（`Bearer public` 全 403），以下保留仅作配额说明。
+如需用自己 Zen 账户的**付费**配额：
 
 ```sh
-railway variables set ZEN_API_KEYS=<key1>,<key2>   # 池
-railway variables unset ZEN_API_KEYS               # 退回匿名
+railway variables set ZEN_API_KEYS=<key1>,<key2>   # 池（付费 key）
 ```
 
 ### 本机测试
 
-默认即匿名免费模式（**无需任何上游 key**）：
-
 ```sh
-PORT=18080 API_KEY=test-key node server.ts
-curl http://127.0.0.1:18080/health          # 期望 "upstreamAuth":"anonymous"
+PORT=18080 API_KEY=test-key ZEN_ACCESS_TOKEN=<st_…> node server.ts
+curl http://127.0.0.1:18080/health          # 期望 "upstreamAuth":"zen-session"
 curl -H "Authorization: Bearer test-key" http://127.0.0.1:18080/v1/models
 curl -H "Authorization: Bearer test-key" -H "Content-Type: application/json" \
   -d '{"model":"mimo-v2.6-flash-free","messages":[{"role":"user","content":"hi"}],"stream":false}' \
-  http://127.0.0.1:18080/v1/chat/completions
+  http://127.0.0.1:18080/v1/chat/completions   # 期望 200 chat.completion
 ```
 
-`/health` 里 `upstreamAuth` 必须是 `anonymous`（不是 `zen-key`），否则说明环境变量里
-残留了 `ZEN_API_*`。Windows PowerShell 下要先清掉进程环境里的同名变量：
+`/health` 里 `upstreamAuth` 应为 `zen-session`；若是 `anonymous` 说明
+`ZEN_ACCESS_TOKEN` 没读到。Windows PowerShell 下要先清掉进程环境里的干扰变量：
 `Get-ChildItem env: | Where-Object { $_.Name -like 'ZEN*' } | ForEach-Object { Remove-Item "env:$($_.Name)" }`。
 
 要求 Node ≥ 22.18（原生运行 TypeScript，无需 `npm install`）。
@@ -293,11 +316,9 @@ curl -H "Authorization: Bearer test-key" -H "Content-Type: application/json" \
 
 ## 已知限制（上游决定，非本服务缺陷）
 
-- **模型只有十来个是正常现象**：Zen 实时列表有 80+ 个模型，绝大多数是
-  **付费模型**（实测匿名调用返回 `401 AuthError "Missing API key."`），另有若干
-  已弃用 / 缺元数据项，真正能匿名免费用的只有十来个（2026-10-13 实测：84 个
-  模型中 11 个可用）。数量随上游上下架浮动。本服务已按三级回退目录如实暴露
-  全部可用项，不是过滤 bug。
+- **模型只有不到十个是正常现象**：Zen 实时列表有 40+ 个模型，付费模型与
+  已弃用项被目录滤掉，真正能免费用的约 9–10 个（2026-10-15 实测）。
+  数量随上游上下架浮动，更新 `adapter/catalog.ts` 的 `staticFreeModels` 即可跟进。
 - **延迟主要来自上游**：网关自身开销 <50ms（TLS 连接池复用 + 启动预热）。
   实测单请求 1.7s–20s 不等，大头是上游 opencode.ai 的排队（`waitHeaders`
   1.4–9.7s）和模型生成耗时（快速模型 <1s，思考模型 5–40s）。同样输入连续
@@ -306,12 +327,12 @@ curl -H "Authorization: Bearer test-key" -H "Content-Type: application/json" \
 - **地区封锁**：部分模型（如 `muse-spark-*`）对特定出口国家返回
   `403 RegionError`，上游会原样透传。把服务部署在不受限地区（如美国）即可绕过，
   这也是 `muse-spark-*` 能默认列出并直接使用的前提。
-- **匿名配额按出口 IP 限流**：触发 429 需等待窗口恢复；Railway 出口 IP 是
-  共享的，高峰期可能更容易撞限。上游返回的 `retry-after` 会原样透传，
-  请让客户端按它退避而不是立刻重试。
+- **`st_…` 约 30 天过期**：到期后免费模型开始 401/403，重跑仓库根
+  `scripts/get-zen-token.mjs --show` 取新值，更新 Railway Variables 并重部署即可。
+  上游返回的 `retry-after` 会原样透传，请让客户端按它退避而不是立刻重试。
 - **未列出的模型回 404**：目录 ready 时（`/health` 里 `catalog.total > 0`）
   请求不在 `/v1/models` 里的模型会直接 404，不再转发给上游；目录尚未就绪的
   启动窗口内仍会放行，由上游判定。
 - **chat 模型不能走 `/v1/responses`**：上游对该组合返回 500，透传之。
-- **上游政策随时可能变化**：这是对 OpenCode 匿名免费通道的复用，不是官方
+- **上游政策随时可能变化**：这是对 OpenCode 免费通道的复用，不是官方
   公开 API；上游收紧（改凭证/缩白名单）会让服务不可用。生产环境请勿依赖。
