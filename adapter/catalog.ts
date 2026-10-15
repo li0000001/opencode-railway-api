@@ -18,7 +18,6 @@ export const ZEN_BASE_URL = 'https://opencode.ai/zen'
 
 /** Live-verified 200 on 2026-10-15 (st_ lane, new gate): the current S1 free roster. */
 export const staticFreeModels: string[] = [
-  'big-pickle', // metadata_free; kept while still listed upstream
   'mimo-v2.6-flash-free', // verified 2026-10-15: chat 200 (stream + non-stream, st_ lane)
   'cat-jam-free', // S1 2026-10-15; region-blocked from CN exits (RegionError = gate passed)
   'jev-1.13-free', // S1 2026-10-15
@@ -26,9 +25,15 @@ export const staticFreeModels: string[] = [
   'longcat-2.5-preview-free', // S1 2026-10-15
   'space-bunny-free', // S1 2026-10-15
   'nemotron-3.5-lightning-free', // S1 2026-10-15
-  'nemotron-3-ultra-free', // metadata_free; kept while still listed upstream
   'muse-spark-1.2-contributor-free', // models.dev deprecated but S1-listed; static vouch kept
   'muse-spark-1.3-contributor-free', // S1 2026-10-15 (Responses-only)
+]
+// S1-listed but call-dead upstream (calling answers 400/401/500 regardless of
+// gate shape). Hidden from the live list AND the S3 fallback with a dedicated
+// source so diagnostics distinguish "upstream delisted" from "we hide it".
+// Re-check occasionally: if upstream revives one, delete its line.
+export const staticDeadModels: string[] = [
+  'big-pickle', // S1-listed 2026-10-15 but chat answers 400
 ]
 
 /** Exposed by /v1/models but without a verified anonymous chat yet. */
@@ -367,6 +372,11 @@ export class ModelCatalog {
   }
 
   decision(model: string): AnonymousDecision {
+    // Call-dead ids are hidden first: upstream lists them but every call fails,
+    // so exposing them only produces confusing 400s in clients.
+    if (staticDeadModels.includes(model)) {
+      return { allowed: false, source: 'upstream_call_dead', known: true }
+    }
     const metadata = decide(model, this.#prices, this.#pricesReady)
     // The S3 vouch only covers ids metadata cannot speak for. A metadata
     // verdict of deprecated is Known, but S3 entries are compile-time verified
