@@ -289,76 +289,158 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
 }
 
 /**
- * The Zen anonymous free lane (live-probed 2026-09-18) rejects chat bodies
- * that do not carry an agent shape: HTTP 403 FreeTierError unless the body
- * streams (`stream: true`) and its `tools` array includes function tools
- * named "bash" AND "read" — descriptions, parameters and every header
- * (User-Agent included) go uninspected. pi-ai always streams, so the
- * chat-path gap is tools only: plain conversations carry none.
+ * The Zen free-lane "content gate" (live-probed 2026-10-14, opencode v2.0.27).
+ * A request reaches a `*-free` model only when ALL of these hold:
+ *
+ *   1. a real OpenCode credential — `Bearer st_…` (an account OAuth access
+ *      token). The old anonymous `Bearer public` now answers 403 FreeTierError,
+ *      and an `oc_sk_…` Zen key answers 403 permission_error ("Workspace
+ *      access denied"). See ids.ts + server.ts `ZEN_ACCESS_TOKEN`.
+ *   2. `User-Agent: opencode/latest/<semver>/cli` (ids.ts).
+ *   3. `x-opencode-session` AND `x-opencode-session-id` in the same request
+ *      (ids.ts disguiseHeaders).
+ *   4. an agent-shaped body: `stream: true`, a `tool_choice` that is not
+ *      "none", and `tools` carrying OpenCode's own `read` and `shell`
+ *      declarations — names, descriptions and parameter schemas included.
+ *      Shrunk or fabricated declarations 403, a description that only shares
+ *      the first characters 403s too, and a *second* tool under either name
+ *      fails as well: the gate wants exactly one official declaration each.
+ *
+ * GATE_TOOL_BODIES below is the pair captured verbatim from that client and
+ * verified 200 against both /zen/v1/chat/completions and /zen/v1/responses.
+ * Refreshing it means re-capturing an opencode request (see README, "上游免费
+ * 通道与内容门禁"): the gate tracks the real client, so its tool text drifts
+ * with each opencode release.
  */
-export const FREE_LANE_GATE_TOOL_NAMES = ['bash', 'read'] as const
+export const FREE_LANE_GATE_TOOL_NAMES = ['read', 'shell'] as const
 
 export interface FreeLaneGateTool {
   type: 'function'
-  function: { name: string; description: string; parameters: Record<string, unknown> }
-}
-
-export function freeLaneGateTool(name: (typeof FREE_LANE_GATE_TOOL_NAMES)[number]): FreeLaneGateTool {
-  return {
-    type: 'function',
-    function: {
-      name,
-      description: 'Reserved for the host runtime; do not call it.',
-      parameters: { type: 'object', properties: {} },
-    },
+  function: {
+    name: string
+    description: string
+    parameters: Record<string, unknown>
+    strict: boolean
   }
 }
 
-/** Responses uses flat function tools and its Zen gateway accepts auto only. */
+const GATE_TOOL_BODIES: Record<(typeof FREE_LANE_GATE_TOOL_NAMES)[number], Omit<FreeLaneGateTool['function'], 'name'>> = {
+  read: {
+    description:
+      'Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'File or directory to read' },
+        offset: {
+          type: 'integer',
+          minimum: 0,
+          description: 'The line or directory entry to start reading from (1-based)',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 0,
+          description: 'The maximum number of lines or directory entries to read (defaults to and capped at 2000)',
+        },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    strict: false,
+  },
+  shell: {
+    description:
+      "Execute a shell command and return its output. Commands run on Windows using powershell. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Shell command string to execute' },
+        workdir: {
+          type: 'string',
+          description:
+            'Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead.',
+        },
+        timeout: {
+          type: 'integer',
+          minimum: 0,
+          description:
+            'Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default.',
+        },
+        background: {
+          type: 'boolean',
+          description:
+            "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion.",
+        },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+    strict: false,
+  },
+}
+
+export function freeLaneGateTool(name: (typeof FREE_LANE_GATE_TOOL_NAMES)[number]): FreeLaneGateTool {
+  return { type: 'function', function: { name, ...GATE_TOOL_BODIES[name] } }
+}
+
+function isGateToolName(name: unknown): boolean {
+  return typeof name === 'string' && (FREE_LANE_GATE_TOOL_NAMES as readonly string[]).includes(name)
+}
+
+/** Chat-completions tools nest under `function`; responses tools are flat. */
+function chatToolName(tool: unknown): unknown {
+  const fn = typeof tool === 'object' && tool !== null ? (tool as { function?: { name?: unknown } }).function : undefined
+  return typeof fn === 'object' && fn !== null ? fn.name : undefined
+}
+
+function responsesToolName(tool: unknown): unknown {
+  const candidate = typeof tool === 'object' && tool !== null ? (tool as { type?: unknown; name?: unknown }) : undefined
+  return candidate?.type === 'function' ? candidate.name : undefined
+}
+
+/**
+ * Drop client tools that collide with the gate pair, then append the official
+ * declarations. Merging instead of replacing would send two `read`s and fail:
+ * the gate matches declarations by name and rejects the whole request when one
+ * of them is not OpenCode's own.
+ */
+function gateTools(tools: unknown[], nameOf: (tool: unknown) => unknown, flatten: boolean): unknown[] {
+  const kept = tools.filter((tool) => !isGateToolName(nameOf(tool)))
+  const injected = FREE_LANE_GATE_TOOL_NAMES.map((name) =>
+    flatten ? { type: 'function', ...freeLaneGateTool(name).function } : freeLaneGateTool(name),
+  )
+  return [...kept, ...injected]
+}
+
+/**
+ * Rewrite a Responses payload (flat function tools) for the free lane. Returns
+ * a new payload; the caller sends it as-is. `tool_choice` "auto" is the only
+ * accepted value there, so anything else is normalised.
+ */
 export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
   const body = payload as Record<string, unknown>
   if (!Array.isArray(body.input)) return undefined
-  const tools = Array.isArray(body.tools) ? body.tools as unknown[] : []
-  const names = new Set(tools.map((tool) => {
-    if (typeof tool !== 'object' || tool === null) return undefined
-    const candidate = tool as { type?: unknown; name?: unknown }
-    return candidate.type === 'function' ? candidate.name : undefined
-  }))
-  const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name))
-  const invalidChoice = body.tool_choice !== undefined && body.tool_choice !== 'auto'
-  if (missing.length === 0 && !invalidChoice) return undefined
-  return {
-    ...body,
-    tools: [...tools, ...missing.map((name) => ({ type: 'function', ...freeLaneGateTool(name).function }))],
-    tool_choice: 'auto',
-  }
+  const tools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
+  const next: Record<string, unknown> = { ...body, tools: gateTools(tools, responsesToolName, true) }
+  if (body.tool_choice !== 'auto') next.tool_choice = 'auto'
+  return next
 }
 
 /**
  * Rewrite an outgoing chat-completions payload so it satisfies the free-lane
- * agent-shape gate (wired through pi-ai's onPayload). Appends only the gate
- * tools the payload is missing; when the context carried no tools at all,
- * tool_choice 'none' keeps the model from ever calling the injected stubs,
- * while client-provided tool choices are preserved untouched. Returns
- * undefined when the payload already satisfies the gate or is not a
- * chat-completions body (pi-ai keeps the original in that case).
+ * content gate (wired through pi-ai's onPayload). Always returns a shaped copy:
+ * the gate inspects the tool declarations themselves, so a payload that merely
+ * *has* a `read` tool still has to be replaced with OpenCode's.
  */
 export function ensureFreeLaneShape(payload: unknown): unknown | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
   const body = payload as Record<string, unknown>
   if (!Array.isArray(body.messages)) return undefined
   const tools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
-  const names = new Set(
-    tools.map((tool) => {
-      const fn = typeof tool === 'object' && tool !== null ? (tool as { function?: { name?: unknown } }).function : undefined
-      return typeof fn === 'object' && fn !== null ? fn.name : undefined
-    }),
-  )
-  const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name))
-  if (missing.length === 0) return undefined
-  const next: Record<string, unknown> = { ...body }
-  next.tools = [...tools, ...missing.map((name) => freeLaneGateTool(name))]
-  if (tools.length === 0) next.tool_choice = 'none'
+  const next: Record<string, unknown> = { ...body, tools: gateTools(tools, chatToolName, false) }
+  // "none" was the old way to keep the model off the injected stubs; the gate
+  // rejects it outright now, and the injected pair is what satisfies it.
+  if (body.tool_choice === 'none') next.tool_choice = 'auto'
   return next
 }

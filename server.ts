@@ -54,21 +54,43 @@ const ZEN_CHAT_URL = `${ZEN_BASE_URL}/v1/chat/completions`
 const ZEN_RESPONSES_URL = `${ZEN_BASE_URL}/v1/responses`
 
 /**
- * Upstream credential — one switch between the two lanes:
- *   unset/empty → anonymous free lane (`Bearer public`, what the plugin ships)
- *   set         → your OpenCode Zen key(s): same base URL, billed to your
- *                 balance instead of the exit IP's anonymous quota.
+ * Upstream credential. Three spellings, all interchangeable in behaviour
+ * (same base URL, same disguise headers, same free-lane shape):
  *
- * `ZEN_API_KEYS` holds a pool (comma / semicolon / whitespace separated) and
- * `ZEN_API_KEY` the single-key spelling; both may be set, they merge. Keys are
- * only ever exposed masked (`oc_sk_c39adb58b31...Bztt`) — never logged whole,
+ *   nothing set      → the anonymous free lane (`Bearer public`). Since
+ *                      2026-10-14 Zen answers 403 FreeTierError for it: the
+ *                      free tier now needs a real OpenCode credential.
+ *   ZEN_ACCESS_TOKEN → the account's OpenCode OAuth access token (`st_…`).
+ *                      This is what the official client uses and the only
+ *                      credential the free models still accept. Read it from
+ *                      the client's own store:
+ *                        sqlite3 ~/.local/share/opencode/opencode.db
+ *                          "select value from credential
+ *                           where integration_id='opencode' and active=1"
+ *                      and take `access` from the JSON (it lasts ~30 days).
+ *   ZEN_API_KEY(S)   → Zen API keys (`oc_sk_…`). They no longer reach the free
+ *                      models (403 "Workspace access denied") but still work
+ *                      for paid ones.
+ *
+ * `ZEN_API_KEYS` holds a pool (comma / semicolon / whitespace separated),
+ * `ZEN_API_KEY` the single-key spelling and `ZEN_ACCESS_TOKEN` the session
+ * token; all may be set, they merge into one pool. Credentials are only ever
+ * exposed masked (`oc_sk_c39adb58b31...Bztt`, `st_***`) — never logged whole,
  * never returned by any endpoint.
  */
-const ZEN_API_KEYS = parseKeyList(`${process.env.ZEN_API_KEYS ?? ''} ${process.env.ZEN_API_KEY ?? ''}`)
+const ZEN_ACCESS_TOKEN = (process.env.ZEN_ACCESS_TOKEN ?? process.env.ZEN_SESSION_TOKEN ?? '').trim()
+const ZEN_API_KEYS = parseKeyList(
+  `${process.env.ZEN_API_KEYS ?? ''} ${process.env.ZEN_API_KEY ?? ''} ${ZEN_ACCESS_TOKEN}`,
+)
 /** Cooldown base for a key that answered 429/401 (exponential, capped). */
 const KEY_COOLDOWN_MS = numEnv('KEY_COOLDOWN_MS', 60_000)
-/** Every key cooling down → serve from the anonymous lane (its own quota). */
-const KEY_POOL_ANONYMOUS = boolEnv('KEY_POOL_ANONYMOUS', true)
+/**
+ * Every credential cooling down → serve from the anonymous lane (its own
+ * quota). Defaults off when a session token is configured: the anonymous
+ * `Bearer public` credential is rejected outright now, so falling back to it
+ * would only replace a real error with a confusing one.
+ */
+const KEY_POOL_ANONYMOUS = boolEnv('KEY_POOL_ANONYMOUS', ZEN_ACCESS_TOKEN === '')
 /** 429/401 answered by one key → retry once on the next ready credential. */
 const KEY_POOL_FAILOVER = boolEnv('KEY_POOL_FAILOVER', true)
 
@@ -80,6 +102,14 @@ function parseKeyList(raw: string): string[] {
   }
   return keys
 }
+
+/**
+ * Appended to the gate's own 403 FreeTierError. Its text is written for a
+ * human running the official client ("use it from within OpenCode"), which
+ * says nothing useful to a gateway, so the four checks are spelled out.
+ */
+const FREE_TIER_HINT =
+  ' [gateway hint: the free tier now matches the client fingerprint - it needs ZEN_ACCESS_TOKEN (an OpenCode account session token, renewed every ~30 days), User-Agent opencode/latest/<version>/cli, both x-opencode-session and x-opencode-session-id, and the official read/shell tool declarations in the body]'
 
 /** Watchdogs mirror the adapter's defaults (first stream event / body idle). */
 const FIRST_EVENT_MS = numEnv('FIRST_EVENT_MS', 30_000)
@@ -161,8 +191,13 @@ const ANONYMOUS_AUTH = 'Bearer public'
 /** Upper bound for the exponential cooldown backoff (401 on a revoked key). */
 const MAX_KEY_COOLDOWN_MS = 10 * 60_000
 
-/** `oc_sk_c39adb58b31...Bztt`: account id + last 4 chars, no secret material. */
+/**
+ * `oc_sk_c39adb58b31...Bztt`: account id + last 4 chars, no secret material.
+ * Session tokens (`st_…`/`rt_…`) get no fingerprint at all — they are account
+ * logins, and `st_<uuid>` would expose most of the UUID.
+ */
 function maskKey(key: string): string {
+  if (key.startsWith('st_') || key.startsWith('rt_')) return `${key.slice(0, 3)}***`
   return key.length <= 20 ? '***' : `${key.slice(0, 16)}...${key.slice(-4)}`
 }
 
@@ -225,9 +260,10 @@ class KeyPool {
     return this.#failover
   }
 
-  get mode(): 'anonymous' | 'zen-key' | 'zen-key-pool' {
+  get mode(): 'anonymous' | 'zen-key' | 'zen-key-pool' | 'zen-session' {
     if (this.#keys.length === 0) return 'anonymous'
-    return this.#keys.length === 1 ? 'zen-key' : 'zen-key-pool'
+    if (this.#keys.length === 1) return this.#keys[0].key.startsWith('st_') ? 'zen-session' : 'zen-key'
+    return 'zen-key-pool'
   }
 
   #ready(now: number): PoolEntry[] {
@@ -765,8 +801,8 @@ function describeUpstreamError(
     upstream.status !== 401
       ? ''
       : keyPool.size > 0
-        ? ' (a configured Zen key was rejected - check ZEN_API_KEY(S) and your balance)'
-        : ' (the anonymous free lane refused this model - paid models need a ZEN_API_KEY)'
+        ? ' (a configured Zen credential was rejected - for a session token, it expired: paste a fresh ZEN_ACCESS_TOKEN; for oc_sk_ keys, check ZEN_API_KEY(S) and your balance)'
+        : ' (no credential configured: the anonymous free lane was closed on 2026-10-14 - set ZEN_ACCESS_TOKEN)'
   let parsed: unknown = null
   try {
     parsed = JSON.parse(text)
@@ -779,7 +815,11 @@ function describeUpstreamError(
     const err = (parsed as { error?: { message?: unknown; type?: unknown } }).error
     const base =
       typeof err?.message === 'string' && err.message.length > 0 ? err.message : text.slice(0, 400)
-    const message = authHint ? `${base}${authHint}` : base
+    // 403 FreeTierError is the gate's own verdict: say what it wants instead of
+    // leaving the caller with "use it from within OpenCode".
+    const gateHint = err?.type === 'FreeTierError' ? FREE_TIER_HINT : ''
+    const note = authHint || gateHint
+    const message = note ? `${base}${note}` : base
     const type = typeof err?.type === 'string' && err.type.length > 0 ? err.type : 'upstream_error'
     const payload = { ...(parsed as object), error: { ...(err as object), message } }
     return { payload, message, type }
@@ -2250,13 +2290,23 @@ server.listen(PORT, () => {
   console.log(`[opencode2dsh-railway] listening on :${PORT}`)
   console.log(`[opencode2dsh-railway] upstream: ${ZEN_BASE_URL}`)
   if (keyPool.size === 0) {
-    console.log('[opencode2dsh-railway] upstream auth: anonymous free lane (set ZEN_API_KEYS to use your Zen keys)')
+    console.log(
+      '[opencode2dsh-railway] upstream auth: anonymous free lane "Bearer public" - ' +
+        'rejected with 403 FreeTierError since 2026-10-14. Set ZEN_ACCESS_TOKEN ' +
+        'to the OpenCode account session token (st_...) to use the free models.',
+    )
   } else {
     const fingerprints = ZEN_API_KEYS.map(maskKey).join(', ')
     console.log(
       `[opencode2dsh-railway] upstream auth: ${keyPool.mode} ` +
-        `(${keyPool.size} key${keyPool.size === 1 ? '' : 's'}: ${fingerprints})`,
+        `(${keyPool.size} credential${keyPool.size === 1 ? '' : 's'}: ${fingerprints})`,
     )
+    if (ZEN_ACCESS_TOKEN === '' && ZEN_API_KEYS.length > 0) {
+      console.log(
+        '[opencode2dsh-railway] note: only oc_sk_ keys configured - the free models ' +
+          'answer 403 "Workspace access denied" for them; ZEN_ACCESS_TOKEN is required there.',
+      )
+    }
     console.log(
       `[opencode2dsh-railway] key pool: sticky=session-hash, cooldown=${KEY_COOLDOWN_MS}ms, ` +
         `failover=${KEY_POOL_FAILOVER ? 'on' : 'off'}, anonymous-fallback=${KEY_POOL_ANONYMOUS ? 'on' : 'off'}`,

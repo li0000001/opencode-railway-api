@@ -16,15 +16,19 @@ import { opencodeUserAgent } from './ids.ts'
 
 export const ZEN_BASE_URL = 'https://opencode.ai/zen'
 
-/** Verified against the anonymous lane with a real chat (agent/internal/catalog/static_models.go). */
+/** Live-verified 200 on 2026-10-15 (st_ lane, new gate): the current S1 free roster. */
 export const staticFreeModels: string[] = [
-  'big-pickle', // verified 2026-08-28: anonymous chat 200 (non-stream + stream)
-  'mimo-v2.5-free', // verified 2026-08-28: anonymous chat 200 (non-stream); models.dev deprecated since 2026-10-03, still answers
-  'mimo-v2.6-flash-free', // verified 2026-10-03: anonymous chat 200 (stream, adapter path); successor of mimo-v2.5-free
-  'ling-3.0-flash-fin-free', // verified 2026-09-01: anonymous chat 200
-  'nemotron-3.5-lightning-free', // verified 2026-09-01: anonymous chat 200
-  'nemotron-3-ultra-free', // verified 2026-09-01: anonymous chat 200 (7s, earlier timeout was transient)
-  'muse-spark-1.2-contributor-free', // verified 2026-09-01: listed free in docs pricing; 403 region-blocked from our probe, region restriction accepted as non-fatal
+  'big-pickle', // metadata_free; kept while still listed upstream
+  'mimo-v2.6-flash-free', // verified 2026-10-15: chat 200 (stream + non-stream, st_ lane)
+  'cat-jam-free', // S1 2026-10-15; region-blocked from CN exits (RegionError = gate passed)
+  'jev-1.13-free', // S1 2026-10-15
+  'step-5-preview-free', // S1 2026-10-15
+  'longcat-2.5-preview-free', // S1 2026-10-15
+  'space-bunny-free', // S1 2026-10-15
+  'nemotron-3.5-lightning-free', // S1 2026-10-15
+  'nemotron-3-ultra-free', // metadata_free; kept while still listed upstream
+  'muse-spark-1.2-contributor-free', // models.dev deprecated but S1-listed; static vouch kept
+  'muse-spark-1.3-contributor-free', // S1 2026-10-15 (Responses-only)
 ]
 
 /** Exposed by /v1/models but without a verified anonymous chat yet. */

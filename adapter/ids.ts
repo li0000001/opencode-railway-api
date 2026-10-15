@@ -106,23 +106,43 @@ export function canonicalSessionID(signal: string): string {
   return `ses_${timePart}${randomPart}`
 }
 
-/** CLI-identical user agent (ids.go opencodeUserAgent, node runtime values). */
+/**
+ * OpenCode's client version, as reported in the User-Agent. The Zen free-lane
+ * gate (2026-10-14) reads it from there and accepts only the official
+ * "latest" spelling — `opencode/latest/<semver>/cli`. The older
+ * `opencode/<semver> (<platform> ...)` shape now answers 403 FreeTierError.
+ * Any current semver passes, so `ZEN_CLIENT_VERSION` is only there to follow
+ * OpenCode's releases without a code change.
+ */
+const ZEN_CLIENT_VERSION = (process.env.ZEN_CLIENT_VERSION ?? '').trim() || '2.0.29'
+
+/** Gate-valid user agent: the shape opencode v2 actually sends upstream. */
 export function opencodeUserAgent(): string {
-  return `opencode/1.18.31 (${process.platform} ${process.arch}; node${process.versions.node})`
+  return `opencode/latest/${ZEN_CLIENT_VERSION}/cli`
 }
 
 /**
- * The full disguise header set sent with every upstream request
- * (design.md 2.4; gateway.go newUpstreamRequest:640-669).
+ * The header set sent with every upstream request — byte-mirrored from the
+ * official client's model-request.ts (live-verified 200 on 2026-10-15,
+ * opencode v2.0.29 source + matrix probes):
+ *
+ * - session under `x-opencode-session` + `x-opencode-session-id` (+ the two
+ *   affinity spellings the client also sends). `x-opencode-session` alone 403s.
+ * - `x-opencode-project: global`: the literal the client sends outside a git
+ *   project. Canonical `prj_*` ids 403 since 2026-10-14; bare 40-hex also
+ *   passes, but `global` is exactly what a gateway (no single project) means.
+ * - NO `x-opencode-request`: the gateway's own correlation header is rejected
+ *   with 403 FreeTierError since 2026-10-14 (bisected live: identical request
+ *   403s with it, 200s without). Request ids stay local-only (logs/pool).
  */
 export function disguiseHeaders(ids: RequestIDs): Record<string, string> {
   return {
     'user-agent': opencodeUserAgent(),
     'x-opencode-client': 'cli',
     'x-opencode-session': ids.session,
+    'x-opencode-session-id': ids.session,
     'x-session-affinity': ids.session,
     'X-Session-Id': ids.session,
-    'x-opencode-request': ids.request,
-    'x-opencode-project': ids.project,
+    'x-opencode-project': 'global',
   }
 }
