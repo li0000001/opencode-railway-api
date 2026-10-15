@@ -465,10 +465,10 @@ export function schemaDepth(node: unknown): number {
  * `additionalProperties` is dropped. Official gate definitions never reach
  * here (returned verbatim above).
  */
-function sanitizeResponsesParameters(tool: Record<string, unknown>): Record<string, unknown> {
-  const raw = tool.parameters
+/** Repair a foreign tool's `parameters` schema (see sanitizeParameters). */
+export function sanitizeParameters(raw: unknown): Record<string, unknown> {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { ...tool, parameters: { type: 'object' } }
+    return { type: 'object' }
   }
   let parameters: Record<string, unknown> = { ...(raw as Record<string, unknown>) }
   const properties = parameters.properties
@@ -495,7 +495,7 @@ function sanitizeResponsesParameters(tool: Record<string, unknown>): Record<stri
     delete parameters.additionalProperties
   }
   if (typeof parameters.type !== 'string') parameters.type = 'object'
-  return { ...tool, parameters: truncateSchemaDepth(parameters, 1) }
+  return parameters
 }
 
 /**
@@ -514,7 +514,8 @@ export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefi
   const shaped = gateTools(tools, responsesToolName, true).map((tool) => {
     if (isGateToolName(responsesToolName(tool))) return tool
     if (typeof tool !== 'object' || tool === null || Array.isArray(tool)) return tool
-    return sanitizeResponsesParameters(truncateSchemaDepth(tool, 0) as Record<string, unknown>)
+    const record = tool as Record<string, unknown>
+    return { ...record, parameters: truncateSchemaDepth(sanitizeParameters(record.parameters), 1) }
   })
   const next: Record<string, unknown> = { ...body, tools: shaped }
   if (body.tool_choice !== 'auto') next.tool_choice = 'auto'
@@ -525,14 +526,27 @@ export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefi
  * Rewrite an outgoing chat-completions payload so it satisfies the free-lane
  * content gate (wired through pi-ai's onPayload). Always returns a shaped copy:
  * the gate inspects the tool declarations themselves, so a payload that merely
- * *has* a `read` tool still has to be replaced with OpenCode's.
+ * *has* a `read` tool still has to be replaced with OpenCode's. Foreign
+ * (harness/MCP) tools get the same depth-cap + structural repair as the
+ * Responses path: the chat backend forwards invalid schemas to its own
+ * provider, which 400s ("Upstream request failed: [400] Provider returned
+ * error", live 2026-10-15 on a harness `question` tool), surfacing as a 500.
  */
 export function ensureFreeLaneShape(payload: unknown): unknown | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
   const body = payload as Record<string, unknown>
   if (!Array.isArray(body.messages)) return undefined
   const tools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
-  const next: Record<string, unknown> = { ...body, tools: gateTools(tools, chatToolName, false) }
+  const shaped = gateTools(tools, chatToolName, false).map((tool) => {
+    if (isGateToolName(chatToolName(tool))) return tool
+    if (typeof tool !== 'object' || tool === null || Array.isArray(tool)) return tool
+    const fn = (tool as { function?: unknown }).function
+    if (fn === null || typeof fn !== 'object' || Array.isArray(fn)) return tool
+    const record = fn as Record<string, unknown>
+    const capped = truncateSchemaDepth(sanitizeParameters(record.parameters), 1)
+    return { ...(tool as Record<string, unknown>), function: { ...record, parameters: capped } }
+  })
+  const next: Record<string, unknown> = { ...body, tools: shaped }
   // "none" was the old way to keep the model off the injected stubs; the gate
   // rejects it outright now, and the injected pair is what satisfies it.
   if (body.tool_choice === 'none') next.tool_choice = 'auto'
