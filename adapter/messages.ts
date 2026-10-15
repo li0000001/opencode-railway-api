@@ -402,10 +402,22 @@ function responsesToolName(tool: unknown): unknown {
  * Drop client tools that collide with the gate pair, then append the official
  * declarations. Merging instead of replacing would send two `read`s and fail:
  * the gate matches declarations by name and rejects the whole request when one
- * of them is not OpenCode's own.
+ * of them is not OpenCode's own. Foreign tools are additionally deduplicated
+ * by name (first wins): a harness that attaches the same skill twice sends
+ * duplicate tool names, and the upstream validator rejects the whole tool
+ * list for it (live 2026-10-15: duplicated `question` on muse-spark).
  */
 function gateTools(tools: unknown[], nameOf: (tool: unknown) => unknown, flatten: boolean): unknown[] {
-  const kept = tools.filter((tool) => !isGateToolName(nameOf(tool)))
+  const seen = new Set<string>()
+  const kept = tools.filter((tool) => {
+    if (isGateToolName(nameOf(tool))) return false
+    const name = nameOf(tool)
+    if (typeof name === 'string' && name.length > 0) {
+      if (seen.has(name)) return false
+      seen.add(name)
+    }
+    return true
+  })
   const injected = FREE_LANE_GATE_TOOL_NAMES.map((name) =>
     flatten ? { type: 'function', ...freeLaneGateTool(name).function } : freeLaneGateTool(name),
   )
@@ -425,14 +437,18 @@ function gateTools(tools: unknown[], nameOf: (tool: unknown) => unknown, flatten
  * value"). Only object nesting counts toward the cap — `required`/`enum`
  * value lists are transparent, so ordinary tools (whose leaves sit at object
  * depth 4, exactly like the genuine definitions) pass through byte-identical
- * and only genuinely pathological schemas change.
+ * and only genuinely pathological schemas change. Over-deep branches become
+ * `{type:'object'}` (NOT boolean `true`: the endpoint's meta-schema requires
+ * `properties` to be an object and rejects boolean schemas with the anyOf
+ * error — live 2026-10-15, the truncated `ask_user_question` items schema
+ * came back quoted verbatim in the rejection).
  */
 export const RESPONSES_MAX_SCHEMA_DEPTH = 5
 
 function truncateSchemaDepth(node: unknown, objectDepth: number): unknown {
   if (Array.isArray(node)) return node.map((item) => truncateSchemaDepth(item, objectDepth))
   if (node !== null && typeof node === 'object') {
-    if (objectDepth >= RESPONSES_MAX_SCHEMA_DEPTH) return true
+    if (objectDepth >= RESPONSES_MAX_SCHEMA_DEPTH) return { type: 'object' }
     const out: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(node)) out[key] = truncateSchemaDepth(value, objectDepth + 1)
     return out
