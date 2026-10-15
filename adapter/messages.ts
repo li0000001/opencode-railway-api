@@ -450,7 +450,28 @@ function truncateSchemaDepth(node: unknown, objectDepth: number): unknown {
   if (node !== null && typeof node === 'object') {
     if (objectDepth >= RESPONSES_MAX_SCHEMA_DEPTH) return { type: 'object' }
     const out: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(node)) out[key] = truncateSchemaDepth(value, objectDepth + 1)
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'properties' && (objectDepth + 1 >= RESPONSES_MAX_SCHEMA_DEPTH || value === null || typeof value !== 'object' || Array.isArray(value))) {
+        // A `properties` MAP must stay a map of name->schema: replacing it with
+        // a schema object puts a string ("object") where a schema belongs, and
+        // a host-sent boolean (`properties:true`) is equally rejected — the
+        // validator quotes either verbatim in its anyOf error (live 2026-10-15).
+        // Empty the map and drop the now-dangling `required` instead.
+        out[key] = {}
+        continue
+      }
+      out[key] = truncateSchemaDepth(value, objectDepth + 1)
+    }
+    if (
+      out.properties !== undefined &&
+      typeof out.properties === 'object' &&
+      out.properties !== null &&
+      !Array.isArray(out.properties) &&
+      Object.keys(out.properties as Record<string, unknown>).length === 0 &&
+      Array.isArray(out.required)
+    ) {
+      delete out.required
+    }
     return out
   }
   return node
