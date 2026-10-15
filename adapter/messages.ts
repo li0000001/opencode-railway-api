@@ -413,16 +413,63 @@ function gateTools(tools: unknown[], nameOf: (tool: unknown) => unknown, flatten
 }
 
 /**
+ * The Responses endpoint validates tool JSON schemas: nesting deeper than 10
+ * levels is rejected outright ("JSON schema exceeds the maximum nesting depth
+ * of 10 levels", live 2026-10-15 on muse-spark-1.3 with the harness/MCP toolset
+ * attached — the chat endpoint does not enforce it, so the same tools pass on
+ * chat models and only Responses calls fail). Cap foreign schemas at the same
+ * depth the genuine gate definitions provably pass (a gate-only Responses
+ * request with 5-deep tools clears validation; counted from the tool object);
+ * official gate definitions are byte-compared by the free-tier gate and are
+ * never touched. Pruned branches become `true` (valid JSON Schema for "any
+ * value"). Only object nesting counts toward the cap — `required`/`enum`
+ * value lists are transparent, so ordinary tools (whose leaves sit at object
+ * depth 4, exactly like the genuine definitions) pass through byte-identical
+ * and only genuinely pathological schemas change.
+ */
+export const RESPONSES_MAX_SCHEMA_DEPTH = 5
+
+function truncateSchemaDepth(node: unknown, objectDepth: number): unknown {
+  if (Array.isArray(node)) return node.map((item) => truncateSchemaDepth(item, objectDepth))
+  if (node !== null && typeof node === 'object') {
+    if (objectDepth >= RESPONSES_MAX_SCHEMA_DEPTH) return true
+    const out: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(node)) out[key] = truncateSchemaDepth(value, objectDepth + 1)
+    return out
+  }
+  return node
+}
+
+/** Max container-nesting depth of a value (objects/arrays count, scalars 0). */
+export function schemaDepth(node: unknown): number {
+  if (Array.isArray(node)) {
+    return node.reduce((max, item) => Math.max(max, schemaDepth(item)), 0) + (node.length > 0 ? 1 : 0)
+  }
+  if (node !== null && typeof node === 'object') {
+    const keys = Object.keys(node)
+    return keys.reduce((max, key) => Math.max(max, schemaDepth((node as Record<string, unknown>)[key])), 0) + (keys.length > 0 ? 1 : 0)
+  }
+  return 0
+}
+
+/**
  * Rewrite a Responses payload (flat function tools) for the free lane. Returns
  * a new payload; the caller sends it as-is. `tool_choice` "auto" is the only
- * accepted value there, so anything else is normalised.
+ * accepted value there, so anything else is normalised. Foreign (harness/MCP)
+ * tool schemas are depth-capped so the endpoint's 10-level validator passes;
+ * recognised official tools keep their genuine definitions verbatim.
  */
 export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
   const body = payload as Record<string, unknown>
   if (!Array.isArray(body.input)) return undefined
   const tools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
-  const next: Record<string, unknown> = { ...body, tools: gateTools(tools, responsesToolName, true) }
+  const shaped = gateTools(tools, responsesToolName, true).map((tool) => {
+    if (isGateToolName(responsesToolName(tool))) return tool
+    if (typeof tool !== 'object' || tool === null) return tool
+    return truncateSchemaDepth(tool, 0)
+  })
+  const next: Record<string, unknown> = { ...body, tools: shaped }
   if (body.tool_choice !== 'auto') next.tool_choice = 'auto'
   return next
 }
