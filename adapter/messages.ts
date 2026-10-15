@@ -453,11 +453,58 @@ export function schemaDepth(node: unknown): number {
 }
 
 /**
+ * Repair structurally invalid foreign schemas on top of the depth cap. The
+ * Responses validator rejects the whole request when one tool's parameters
+ * are not a valid function schema ("... is not valid under any of the schemas
+ * listed in the 'anyOf' keyword", live 2026-10-15: a harness `question` tool
+ * whose `properties` is boolean `true`). The chat endpoint tolerates the same
+ * shapes, so this runs on the Responses path only. Rules are minimal and only
+ * ever loosen: non-object parameters become `{type:'object'}`; a non-object
+ * `properties` is dropped together with its dangling `required`; `required`
+ * entries not present in `properties` are filtered out; a non-boolean
+ * `additionalProperties` is dropped. Official gate definitions never reach
+ * here (returned verbatim above).
+ */
+function sanitizeResponsesParameters(tool: Record<string, unknown>): Record<string, unknown> {
+  const raw = tool.parameters
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ...tool, parameters: { type: 'object' } }
+  }
+  let parameters: Record<string, unknown> = { ...(raw as Record<string, unknown>) }
+  const properties = parameters.properties
+  if (properties !== undefined && (properties === null || typeof properties !== 'object' || Array.isArray(properties))) {
+    delete parameters.properties
+    delete parameters.required
+  } else if (
+    Array.isArray(parameters.required) &&
+    properties !== undefined &&
+    typeof properties === 'object' &&
+    properties !== null &&
+    !Array.isArray(properties)
+  ) {
+    const declared = new Set(Object.keys(properties as Record<string, unknown>))
+    const kept = (parameters.required as unknown[]).filter(
+      (name): name is string => typeof name === 'string' && declared.has(name),
+    )
+    if (kept.length !== (parameters.required as unknown[]).length) {
+      if (kept.length > 0) parameters.required = kept
+      else delete parameters.required
+    }
+  }
+  if (parameters.additionalProperties !== undefined && typeof parameters.additionalProperties !== 'boolean') {
+    delete parameters.additionalProperties
+  }
+  if (typeof parameters.type !== 'string') parameters.type = 'object'
+  return { ...tool, parameters: truncateSchemaDepth(parameters, 1) }
+}
+
+/**
  * Rewrite a Responses payload (flat function tools) for the free lane. Returns
  * a new payload; the caller sends it as-is. `tool_choice` "auto" is the only
  * accepted value there, so anything else is normalised. Foreign (harness/MCP)
- * tool schemas are depth-capped so the endpoint's 10-level validator passes;
- * recognised official tools keep their genuine definitions verbatim.
+ * tool schemas are depth-capped and structurally repaired so the endpoint's
+ * validators pass; recognised official tools keep their genuine definitions
+ * verbatim.
  */
 export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
@@ -466,8 +513,8 @@ export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefi
   const tools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
   const shaped = gateTools(tools, responsesToolName, true).map((tool) => {
     if (isGateToolName(responsesToolName(tool))) return tool
-    if (typeof tool !== 'object' || tool === null) return tool
-    return truncateSchemaDepth(tool, 0)
+    if (typeof tool !== 'object' || tool === null || Array.isArray(tool)) return tool
+    return sanitizeResponsesParameters(truncateSchemaDepth(tool, 0) as Record<string, unknown>)
   })
   const next: Record<string, unknown> = { ...body, tools: shaped }
   if (body.tool_choice !== 'auto') next.tool_choice = 'auto'
