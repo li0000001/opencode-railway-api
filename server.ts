@@ -44,6 +44,13 @@ import {
   resolveUpstreamProxy,
   type TunnelEvent,
 } from './proxy.ts'
+import {
+  DEFAULT_PROXY_SOURCES,
+  ProxyPool,
+  createZenProbe,
+  proxyRotationReason,
+  type ProxyPoolSource,
+} from './proxy-pool.ts'
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -461,20 +468,90 @@ const proxiedAgents =
       }
 
 /**
- * The agent for one upstream host: the tunnel agent when a proxy is configured
- * and `NO_PROXY` does not cover that host, the direct agent otherwise.
+ * The agent for one upstream host: the pool's current exit when auto mode is
+ * on, the fixed tunnel when a proxy is configured, the direct agent otherwise
+ * (`NO_PROXY` wins in every mode).
  */
 function upstreamAgentFor(host: string, fresh: boolean): https.Agent {
+  if (proxyPool !== null && !egress.noProxy.matches(host, 443)) {
+    const lease = proxyPool.lease()
+    if (lease === null) throw new PoolWarmingError('the free-proxy pool has no clean exit yet')
+    return fresh ? lease.fresh : lease.pooled
+  }
   if (proxiedAgents !== null && !egress.noProxy.matches(host, 443)) {
     return fresh ? proxiedAgents.fresh : proxiedAgents.pooled
   }
   return fresh ? freshAgent : upstreamAgent
 }
 
-/** True when the configured proxy actually carries the Zen traffic. */
+/** True when the configured egress actually carries the Zen traffic. */
 function proxyAppliesToUpstream(): boolean {
+  if (proxyPool !== null) return !egress.noProxy.matches(UPSTREAM_HOST, 443)
   return proxiedAgents !== null && !egress.noProxy.matches(UPSTREAM_HOST, 443)
 }
+
+// ---------------------------------------------------------------------------
+// Free-proxy auto pool (PROXY_POOL=auto)
+// ---------------------------------------------------------------------------
+
+/**
+ * `PROXY_POOL=auto` replaces the single fixed exit with a self-managed stock:
+ * the gateway pulls public proxy lists, probes every candidate with a real
+ * free-lane request and rotates on 403 (flagged IP) / 429 (spent quota).
+ * proxy-pool.ts owns the scanning and selection; here we only read the
+ * environment and hand over the tunnel telemetry + DNS cache.
+ *
+ * `UPSTREAM_PROXY` is ignored in this mode (the pool is the egress), but
+ * `NO_PROXY` still exempts hosts. `PROXY_POOL_SEED` short-circuits the first
+ * scan with known-good exits.
+ */
+const PROXY_POOL_FLAG = (process.env.PROXY_POOL ?? process.env.FREE_PROXY_POOL ?? '').trim().toLowerCase()
+const PROXY_POOL_ENABLED = ['auto', '1', 'on', 'true', 'yes'].includes(PROXY_POOL_FLAG)
+const PROXY_POOL_TARGET = numEnv('PROXY_POOL_TARGET', 5)
+const PROXY_POOL_REFRESH_MS = numEnv('PROXY_POOL_REFRESH_MS', 600_000)
+const PROXY_POOL_MAX_PROBE = numEnv('PROXY_POOL_MAX_PROBE', 120)
+/** How many different exits one client request may try before giving up. */
+const PROXY_POOL_ATTEMPTS = Math.max(1, Math.min(4, numEnv('PROXY_POOL_ATTEMPTS', 3)))
+const PROXY_POOL_PROBE_TIMEOUT_MS = numEnv('PROXY_POOL_PROBE_TIMEOUT_MS', 25_000)
+const PROXY_POOL_PROBE_MODEL = (process.env.PROXY_POOL_PROBE_MODEL ?? 'mimo-v2.6-flash-free').trim()
+
+function parsePoolSources(): ProxyPoolSource[] {
+  const raw = (process.env.PROXY_POOL_SOURCES ?? '').trim()
+  if (raw === '') return DEFAULT_PROXY_SOURCES
+  const out: ProxyPoolSource[] = []
+  for (const url of raw.split(/[\s,;]+/)) {
+    if (url.length === 0) continue
+    const protocol: 'http' | 'socks5' = /socks/i.test(url) ? 'socks5' : 'http'
+    out.push({ url, protocol, format: /json|geonode/i.test(url) ? 'geonode' : 'text' })
+  }
+  return out.length > 0 ? out : DEFAULT_PROXY_SOURCES
+}
+
+/** Raised while auto mode has no validated exit yet (mapped to 503 + Retry-After). */
+class PoolWarmingError extends Error {}
+
+const proxyPool: ProxyPool | null = PROXY_POOL_ENABLED
+  ? new ProxyPool({
+      sources: parsePoolSources(),
+      seed: (process.env.PROXY_POOL_SEED ?? '').split(/[\s,;]+/).filter((part) => part.trim().length > 0),
+      targetSize: PROXY_POOL_TARGET,
+      maxProbe: PROXY_POOL_MAX_PROBE,
+      refreshMs: PROXY_POOL_REFRESH_MS,
+      coolingMs: numEnv('PROXY_POOL_COOLING_MS', 120_000),
+      connectTimeoutMs: PROXY_CONNECT_TIMEOUT_MS,
+      probeTimeoutMs: PROXY_POOL_PROBE_TIMEOUT_MS,
+      concurrency: numEnv('PROXY_POOL_CONCURRENCY', 8),
+      lookup: cachedLookup,
+      onTunnel: noteTunnel,
+      probe: createZenProbe({
+        zenBaseUrl: ZEN_BASE_URL,
+        model: PROXY_POOL_PROBE_MODEL,
+        connectTimeoutMs: PROXY_CONNECT_TIMEOUT_MS,
+        timeoutMs: PROXY_POOL_PROBE_TIMEOUT_MS,
+        onTunnel: noteTunnel,
+      }),
+    })
+  : null
 
 // ---------------------------------------------------------------------------
 // Model catalog (S1 live ∩ S2 free-decision, S3 static fallback)
@@ -488,8 +565,11 @@ const catalog = new ModelCatalog({
   authorization: () => keyPool.catalogAuthorizations(),
   // Same egress as the chat path: the Zen models list rides the tunnel when a
   // proxy is configured (models.dev follows the same per-host NO_PROXY rule).
+  // In pool mode the catalog stays direct on purpose: `GET /v1/models` is not
+  // gated by the IP check (only the chat lane is), and the proxy stock should
+  // be spent on chat traffic, not on a 5-minute listing refresh.
   fetchImpl: createEgressFetch({
-    proxy: egress.proxy,
+    proxy: proxyPool !== null ? null : egress.proxy,
     noProxy: egress.noProxy,
     connectTimeoutMs: PROXY_CONNECT_TIMEOUT_MS,
     lookup: cachedLookup,
@@ -709,6 +789,29 @@ interface UpstreamResponse {
   timings: { tlsMs: number | null; headersMs: number }
 }
 
+/** A non-2xx response, read whole so it can be inspected *and* relayed. */
+async function bufferedResponse(response: UpstreamResponse): Promise<UpstreamResponse> {
+  const text = await response.text().catch(() => '')
+  return {
+    ok: response.ok,
+    status: response.status,
+    headers: response.headers,
+    body: null,
+    text: async () => text,
+    timings: response.timings,
+  }
+}
+
+/**
+ * A pooled keep-alive socket may have been closed by the upstream edge while
+ * idle; the first POST on it dies with ECONNRESET/socket hang up before any
+ * byte was processed. Retry that case exactly once on a fresh socket.
+ */
+function isStaleSocketError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code
+  return code === 'ECONNRESET' || code === 'EPIPE' || code === 'UND_ERR_SOCKET' || /socket hang up/i.test(String((err as Error).message))
+}
+
 async function zenFetch(
   url: string,
   upstreamBody: Record<string, unknown>,
@@ -718,33 +821,102 @@ async function zenFetch(
   // Holds whichever credential the attempt below picked, so the failover pass
   // can tell whether there is anywhere else to go.
   const attempt: { entry: PoolEntry | null } = { entry: null }
-  let response: UpstreamResponse
-  try {
-    response = await zenFetchOnce(url, upstreamBody, messages, signal, attempt)
-  } catch (err) {
-    // A pooled keep-alive socket may have been closed by the upstream edge while
-    // idle; the first POST on it dies with ECONNRESET/socket hang up before any
-    // byte was processed. Retry that case exactly once on a fresh socket.
-    if (signal.aborted) throw err
-    const code = (err as NodeJS.ErrnoException).code
-    const stale = code === 'ECONNRESET' || code === 'EPIPE' || code === 'UND_ERR_SOCKET' || /socket hang up/i.test(String((err as Error).message))
-    if (!stale) throw err
-    console.warn(`[upstream] stale pooled socket (${code ?? 'hang up'}), retrying once on a fresh connection`)
-    response = await zenFetchOnce(url, upstreamBody, messages, signal, attempt, upstreamAgentFor(new URL(url).hostname, true))
+  // Pool mode: one attempt per available exit, so a flagged/quota-dead exit is
+  // swapped for a spare instead of surfacing to the client.
+  const proxyAttempts = proxyPool === null ? 1 : PROXY_POOL_ATTEMPTS
+  let keyFailoverUsed = false
+  let lastError: unknown = null
+  let lastResponse: UpstreamResponse | null = null
+
+  for (let attemptIndex = 0; attemptIndex < proxyAttempts; attemptIndex += 1) {
+    // Each iteration leases the *current* exit: a bad report below retires it,
+    // so the next iteration naturally walks to the next ready spare.
+    const lease = proxyPool === null ? null : proxyPool.lease()
+    if (proxyPool !== null && lease === null) throw new PoolWarmingError('the free-proxy pool has no clean exit yet')
+
+    let response: UpstreamResponse | null = null
+    try {
+      response = await zenFetchOnce(url, upstreamBody, messages, signal, attempt, lease?.pooled)
+    } catch (err) {
+      if (signal.aborted) throw err
+      lastError = err
+      proxyPool?.reportError(lease?.entry ?? null, err)
+      if (isStaleSocketError(err)) {
+        console.warn(`[upstream] stale pooled socket (${(err as NodeJS.ErrnoException).code ?? 'hang up'}), retrying once on a fresh connection`)
+        try {
+          const fresh = lease === null ? upstreamAgentFor(new URL(url).hostname, true) : lease.fresh
+          response = await zenFetchOnce(url, upstreamBody, messages, signal, attempt, fresh)
+        } catch (retryErr) {
+          if (signal.aborted) throw retryErr
+          lastError = retryErr
+          proxyPool?.reportError(lease?.entry ?? null, retryErr)
+          response = null
+        }
+      }
+    }
+
+    if (response === null) {
+      if (lease !== null && attemptIndex + 1 < proxyAttempts) {
+        console.warn(`[proxy-pool] rotating after a connection failure through ${lease.entry.masked}`)
+        continue
+      }
+      throw lastError ?? new Error('upstream request failed')
+    }
+
+    if (response.ok) {
+      proxyPool?.reportSuccess(lease?.entry ?? null)
+      return response
+    }
+
+    const buffered = await bufferedResponse(response)
+    const text = await buffered.text()
+    proxyPool?.reportStatus(lease?.entry ?? null, buffered.status, text)
+    lastResponse = buffered
+
+    // Auto mode: a spent quota (429) or an abuse-gate 403 is about the *exit*,
+    // not the credential — retire it and retry through the next spare.
+    const rotation = proxyRotationReason(buffered.status, text)
+    if (lease !== null && rotation !== null && attemptIndex + 1 < proxyAttempts) {
+      console.warn(`[proxy-pool] rotating after HTTP ${buffered.status} (${rotation}) through ${lease.entry.masked}`)
+      continue
+    }
+
+    // Credential failover: the 429/401 above already put that key in cooldown,
+    // so the retry walks to the next ready key (or the anonymous lane). One
+    // extra hop, pool only — the anonymous lane has nowhere to fail over to,
+    // which keeps its 429s passing through untouched as before.
+    if (
+      keyPool.failover &&
+      (buffered.status === 429 || buffered.status === 401) &&
+      !keyFailoverUsed &&
+      keyPool.canFailover(attempt.entry)
+    ) {
+      keyFailoverUsed = true
+      console.warn(
+        `[key] failing over after HTTP ${buffered.status} from ${attempt.entry ? attempt.entry.masked : 'anonymous'}`,
+      )
+      try {
+        const retried = await zenFetchOnce(url, upstreamBody, messages, signal, attempt, lease?.pooled)
+        if (retried.ok) {
+          proxyPool?.reportSuccess(lease?.entry ?? null)
+          return retried
+        }
+        const bufferedRetry = await bufferedResponse(retried)
+        proxyPool?.reportStatus(lease?.entry ?? null, bufferedRetry.status, await bufferedRetry.text())
+        return bufferedRetry
+      } catch (err) {
+        if (signal.aborted) throw err
+        lastError = err
+        proxyPool?.reportError(lease?.entry ?? null, err)
+        throw err
+      }
+    }
+
+    return buffered
   }
-  // Credential failover: the 429/401 above already put that key in cooldown,
-  // so the retry walks to the next ready key (or the anonymous lane). One
-  // extra hop, pool only — the anonymous lane has nowhere to fail over to,
-  // which keeps its 429s passing through untouched as before.
-  if (keyPool.failover && (response.status === 429 || response.status === 401) && keyPool.canFailover(attempt.entry)) {
-    // Drain the refused body first: leaving it unread would poison the socket.
-    await response.text().catch(() => '')
-    console.warn(
-      `[key] failing over after HTTP ${response.status} from ${attempt.entry ? attempt.entry.masked : 'anonymous'}`,
-    )
-    return await zenFetchOnce(url, upstreamBody, messages, signal, attempt)
-  }
-  return response
+
+  if (lastResponse !== null) return lastResponse
+  throw lastError ?? new Error('upstream request failed')
 }
 
 async function zenFetchOnce(
@@ -892,6 +1064,30 @@ function pickUpstreamHeaders(upstream: UpstreamResponse): Record<string, string>
     if (value) out[name] = value
   }
   return out
+}
+
+/**
+ * Map a thrown zenFetch to a client-visible status. Pool mode has one extra
+ * state worth its own answer: while it has no clean exit yet (boot, or every
+ * known exit just died) nothing was attempted at all, so 503 + Retry-After is
+ * honest where 502 would read like an upstream failure.
+ */
+function upstreamUnreachable(err: unknown): {
+  status: number
+  message: string
+  type: string
+  headers?: Record<string, string>
+} {
+  const message = err instanceof Error ? err.message : String(err)
+  if (err instanceof PoolWarmingError) {
+    return {
+      status: 503,
+      message: `free-proxy pool is still scanning for a clean exit — retry shortly (${message})`,
+      type: 'upstream_error',
+      headers: { 'retry-after': '15' },
+    }
+  }
+  return { status: 502, message: `cannot reach Zen upstream: ${message}`, type: 'upstream_error' }
 }
 
 /**
@@ -1440,8 +1636,8 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse): 
       upstream = await zenFetch(ZEN_CHAT_URL, upstreamBody, clientBody.messages, controller.signal)
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    fail(502, `cannot reach Zen upstream: ${message}`, 'upstream_error')
+    const described = upstreamUnreachable(err)
+    fail(described.status, described.message, described.type, described.headers)
     req.off('close', onClose)
     return
   }
@@ -2066,8 +2262,8 @@ async function handleChatViaResponses(
       controller.signal,
     )
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    fail(502, `cannot reach Zen upstream: ${message}`, 'upstream_error')
+    const described = upstreamUnreachable(err)
+    fail(described.status, described.message, described.type, described.headers)
     req.off('close', onClose)
     return
   }
@@ -2188,8 +2384,8 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse): Promi
       controller.signal,
     )
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    fail(502, `cannot reach Zen upstream: ${message}`, 'upstream_error')
+    const described = upstreamUnreachable(err)
+    fail(described.status, described.message, described.type, described.headers)
     req.off('close', onClose)
     return
   }
@@ -2259,16 +2455,21 @@ function handleHealth(res: ServerResponse, snapshot: CatalogSnapshot): void {
     // logs carry it) — a leaked proxy endpoint invites exactly the abuse the
     // abuse gate already suspects.
     egress: {
-      proxy: egress.proxy === null ? null : {
-        protocol: egress.proxy.protocol,
-        authenticated: egress.proxy.username !== undefined,
-        source: egress.proxy.source,
-        appliesToUpstream: proxyAppliesToUpstream(),
-      },
+      mode: proxyPool !== null ? 'pool' : egress.proxy === null ? 'direct' : 'fixed',
+      ...(proxyPool !== null
+        ? { pool: proxyPool.snapshot(false) }
+        : {
+            proxy: egress.proxy === null ? null : {
+              protocol: egress.proxy.protocol,
+              authenticated: egress.proxy.username !== undefined,
+              source: egress.proxy.source,
+              appliesToUpstream: proxyAppliesToUpstream(),
+            },
+            // A misconfigured value is flagged here but never echoed: the startup
+            // log and the status file carry the (redacted) message.
+            ...(egress.error === null ? {} : { proxyConfigError: true }),
+          }),
       tunnels: { ok: proxyTunnels.ok, failed: proxyTunnels.failed },
-      // A misconfigured value is flagged here but never echoed: the startup log
-      // and the status file carry the (redacted) message.
-      ...(egress.error === null ? {} : { proxyConfigError: true }),
     },
     inflight: stats.inflight,
     requests: stats.requests,
@@ -2364,11 +2565,16 @@ async function writeStatusFile(): Promise<void> {
       // The private snapshot may name the proxy (host:port only, credentials
       // never leave memory) — it stays on the deployment's own disk.
       egress: {
-        proxy: egress.proxy === null ? null : maskProxy(egress.proxy),
-        source: egress.source,
-        appliesToUpstream: proxyAppliesToUpstream(),
+        mode: proxyPool !== null ? 'pool' : egress.proxy === null ? 'direct' : 'fixed',
+        ...(proxyPool !== null
+          ? { pool: proxyPool.snapshot(true) }
+          : {
+              proxy: egress.proxy === null ? null : maskProxy(egress.proxy),
+              source: egress.source,
+              appliesToUpstream: proxyAppliesToUpstream(),
+              error: egress.error,
+            }),
         tunnels: { ok: proxyTunnels.ok, failed: proxyTunnels.failed },
-        error: egress.error,
       },
       upstream: {
         status: stats.lastUpstreamStatus,
@@ -2442,10 +2648,16 @@ catalog.start().catch((err) => {
  */
 let poolWarmed = false
 function warmUpstreamPool(): void {
+  let agent: https.Agent
+  try {
+    agent = upstreamAgentFor(UPSTREAM_HOST, false)
+  } catch {
+    return // pool mode before the first clean exit: nothing to warm yet
+  }
   https
     .get(
       `${ZEN_BASE_URL}/v1/models`,
-      { agent: upstreamAgentFor(UPSTREAM_HOST, false), lookup: cachedLookup, headers: { authorization: keyPool.warmAuth(), 'x-opencode-client': 'cli' } },
+      { agent, lookup: cachedLookup, headers: { authorization: keyPool.warmAuth(), 'x-opencode-client': 'cli' } },
       (r) => {
         r.resume()
         r.on('end', () => {
@@ -2465,7 +2677,17 @@ warmTimer.unref?.()
 server.listen(PORT, () => {
   console.log(`[opencode2dsh-railway] listening on :${PORT}`)
   console.log(`[opencode2dsh-railway] upstream: ${ZEN_BASE_URL}`)
-  if (egress.error !== null) {
+  if (proxyPool !== null) {
+    console.log(
+      `[proxy-pool] auto egress: scanning ${proxyPool.sources.length} public list(s) for clean exits ` +
+        `(target=${PROXY_POOL_TARGET}, refresh=${Math.round(PROXY_POOL_REFRESH_MS / 1000)}s, ` +
+        `attempts/request=${PROXY_POOL_ATTEMPTS}, probe=${PROXY_POOL_PROBE_MODEL})`,
+    )
+    if (egress.proxy !== null) {
+      console.log(`[proxy-pool] note: UPSTREAM_PROXY (${maskProxy(egress.proxy)}) is ignored while auto mode is on`)
+    }
+    proxyPool.start()
+  } else if (egress.error !== null) {
     console.warn(`[proxy] ${egress.error} — continuing with a direct upstream connection`)
   } else if (egress.proxy === null) {
     console.log('[proxy] upstream egress: direct (set UPSTREAM_PROXY / HTTPS_PROXY / ALL_PROXY to route it through a clean exit)')
@@ -2507,6 +2729,7 @@ function shutdown(signal: string): void {
   console.log(`[opencode2dsh-railway] ${signal} — draining ${stats.inflight} in-flight request(s)`)
   catalog.stop()
   clearInterval(warmTimer)
+  proxyPool?.stop()
   scheduleStatusWrite(true)
   void statusWriteChain
   server.close(() => process.exit(0))

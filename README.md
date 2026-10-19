@@ -145,6 +145,17 @@ Studio 或任何支持 `base_url + API key` 的客户端调用。
 | `UPSTREAM_PROXY` | 否 | — | **出口代理**：上游流量（`opencode.ai` + `models.dev`）改由该代理出去，见下节。支持 `http://`、`https://`、`socks5://`（`socks5h://`、`socks://` 等价，域名一律交给代理解析）。也认标准变量 `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY`，优先级：`UPSTREAM_PROXY` > `HTTPS_PROXY` > `ALL_PROXY` > `HTTP_PROXY`；不设则直连（与旧行为一致） |
 | `NO_PROXY` | 否 | — | 逗号分隔的直连名单（按目标主机逐个判断）：`models.dev` 让元数据走直连、`*` 表示全部直连。支持 `.example.com`（含子域）与 `host:port`（限定端口） |
 | `PROXY_CONNECT_TIMEOUT_MS` | 否 | `20000` | 建隧道总预算：连代理 + CONNECT/SOCKS5 握手 + 隧道内 TLS 握手。超时按普通上游错误处理（502，可被 key 池/重试逻辑看见） |
+| `PROXY_POOL` | 否 | — | `auto`（或 `1`/`on`/`true`）：**免费代理自动池**——自动抓取公开代理列表、逐个用真实免费模型请求探活、坏出口自动轮换，见「免费代理自动池」节。开启后 `UPSTREAM_PROXY` 被忽略 |
+| `PROXY_POOL_TARGET` | 否 | `5` | 池里保持的「已验证可用出口」数量；低于该值会自动重新扫描 |
+| `PROXY_POOL_ATTEMPTS` | 否 | `3` | 单次客户端请求最多尝试几个不同出口（429/403 判定为出口问题即换下一个） |
+| `PROXY_POOL_MAX_PROBE` | 否 | `120` | 单轮扫描最多探活多少个候选（含 TCP 预筛后的实际探测数） |
+| `PROXY_POOL_REFRESH_MS` | 否 | `600000` | 池满时的后台重扫间隔；池空时每 60s 重试，未满时最多 3 分钟一次 |
+| `PROXY_POOL_SEED` | 否 | — | 逗号分隔的预置出口（如 `socks5://1.2.3.4:1080,http://5.6.7.8:3128`），启动时最先验证，避免冷启动等待 |
+| `PROXY_POOL_SOURCES` | 否 | 内置 15 个公开列表 | 逗号分隔的自定义列表 URL；含 `socks` 的按 socks5 解析，含 `json`/`geonode` 的按 JSON 解析 |
+| `PROXY_POOL_PROBE_MODEL` | 否 | `mimo-v2.6-flash-free` | 探活用的免费模型 id（探针用 `Bearer public`，不消耗你的 key） |
+| `PROXY_POOL_CONCURRENCY` | 否 | `16` | 探活并发数 |
+| `PROXY_POOL_PROBE_TIMEOUT_MS` | 否 | `15000` | 单个候选探活超时（超时即判死） |
+| `PROXY_POOL_COOLING_MS` | 否 | `120000` | 出口撞 429（额度用尽）后的冷却时长，冷却结束会重新探活 |
 | `ZEN_ACCESS_TOKEN` | **是（免费模型）** | — | **上游凭证**：OpenCode 账号 OAuth token（`st_…`，约 30 天过期）。免费模型只认它。取法见仓库根 `docs/zen-free-lane-ops.md` 第 3 节。key 不写日志、不被任何接口回显（`/health` 只报 `st_***` 掩码） |
 | `ZEN_SESSION_TOKEN` | 否 | — | `ZEN_ACCESS_TOKEN` 的别名 |
 | `ZEN_CLIENT_VERSION` | 否 | `2.0.29` | 伪装 UA 里的官方客户端版本号，跟随 OpenCode 发版改即可 |
@@ -294,6 +305,55 @@ railway variables set NO_PROXY=models.dev
   若多个部署共用同一个出口 IP，仍可能被一起判滥用。
 - 代理密码与上游 key 一样只存在于内存和掩码日志里（`socks5://user:***@host:1080`）。
 
+## 免费代理自动池（`PROXY_POOL=auto`）
+
+固定 `UPSTREAM_PROXY` 的弱点是**单点**：一个免费出口几小时内就死，或者被门禁标记 /
+额度耗尽，网关随即整体 403/429。开了自动池之后，这个出口不再需要人管：
+
+```sh
+railway variables set PROXY_POOL=auto
+# 可选：先把已知能用的出口喂进去，冷启动立即有货
+railway variables set PROXY_POOL_SEED="socks5://1.2.3.4:1083,http://5.6.7.8:8080"
+```
+
+| 环节 | 行为 |
+| --- | --- |
+| **抓列表** | 每次需要补货时并行抓取内置的 15 个公开源（GitHub 原始列表、proxyscrape、geonode…），解析 `ip:port` / `scheme://user:pass@host:port`，去重后 TCP 快速预筛（1.5s 超时） |
+| **探活** | 对存活候选逐个发**真实的免费模型请求**：伪装头 + free-lane 形状 + `Bearer public`（不耗你的 key）。判据只有一条：**上游 200** |
+| **判定** | `200` → `clean`（带延迟排序）；`429` → `cooling`（出口额度用尽，冷却 2 分钟后重试）；`403 abusive traffic` → `dead`（IP 被门禁拉黑）；隧道失败/超时 → `dead` |
+| **选路** | 客户端流量固定走当前 `clean` 出口（保持连接池预热和该出口的额度节奏），一旦真实流量报 429 / abusive 403 就当场退役并换下一个 spare |
+| **请求内轮换** | 一次客户端请求最多试 `PROXY_POOL_ATTEMPTS` 个出口：出口死了/被拉黑/额度用尽 → 立刻换下一个重试，客户端仍可能看到 200 |
+| **补货** | 出口退役导致库存不足时立即在后台重扫（与进行中的扫描共享同一轮，不重复探测）；池空时 60s 一轮、未满时最多 3 分钟一轮、满员时 10 分钟一轮 |
+| **硬约束** | 和固定代理一样**绝不静默回退直连**：池里一个可用出口都没有时请求回 `503 + Retry-After: 15`（而不是把直连的 403 当上游错误报出去）。连接池、看门狗、key 池、`NO_PROXY` 全部照旧 |
+
+**怎么看状态**：启动后日志会出现
+
+```
+[proxy-pool] auto egress: scanning 15 public list(s) for clean exits (target=5, refresh=600s, attempts/request=3, probe=mimo-v2.6-flash-free)
+[proxy-pool] clean exit: socks5://45.138.157.212:1080 (5652ms)
+[proxy-pool] refresh in 41253ms: clean=2 cooling=1 dead=72 pending=0 tracked=75 probes=80 sources=13/15
+[proxy-pool] retired socks5://45.138.157.212:1080: exit IP flagged by the abuse gate (403)
+```
+
+`GET /health` 的 `egress` 块变成 `mode: "pool"`（依旧**不含**出口地址）：
+
+```jsonc
+"egress": {
+  "mode": "pool",
+  "pool": { "mode": "pool", "targetSize": 5, "clean": 2, "cooling": 1, "dead": 72, "pending": 0,
+             "tracked": 75, "probesLastRefresh": 80, "refreshSecondsAgo": 12, "refreshMs": 600000,
+             "sources": 15, "lastError": "" },
+  "tunnels": { "ok": 3, "failed": 0 }
+}
+```
+
+完整出口地址只出现在 `STATUS_PATH` 落盘快照里（`pool.current`），公网接口永不回显。
+
+**忠实提醒**：免费公开代理是**共享、易死**的资源——一次实测扫描 520 个候选里最终稳定能用的
+只有 1–2 个，而且可能几十秒内就死。自动池把它变成了「不需要你动手」而不是「变得可靠」：
+日常请求偶尔会撞上 503（重试即恢复），极端时（公开列表集体失效）需要看日志或重新播种。
+要稳定，还是那两条路：向代理商家要**住宅/独享 IP**（先测再买），或者一台干净的小 VPS。
+
 ## 部署到 Railway
 
 本目录是**自包含**的：`adapter/` 已拷入插件源码，`railway.json` + `Dockerfile`
@@ -301,8 +361,8 @@ railway variables set NO_PROXY=models.dev
 
 方式 A —— GitHub 仓库（推荐）：
 
-1. 新建一个 GitHub 仓库，把**本文件夹的全部内容**（7 项：`Dockerfile`、
-   `railway.json`、`package.json`、`server.ts`、`proxy.ts`、`README.md`、`adapter/`）
+1. 新建一个 GitHub 仓库，把**本文件夹的全部内容**（8 项：`Dockerfile`、
+   `railway.json`、`package.json`、`server.ts`、`proxy.ts`、`proxy-pool.ts`、`README.md`、`adapter/`）
    放进去（`test/` 可选，只用于本机自测）。
 2. Railway → **New Project → Deploy from GitHub repo**，选择该仓库。
    本目录的 `railway.json` 会自动选用 `Dockerfile` 构建。
@@ -347,10 +407,10 @@ curl -H "Authorization: Bearer test-key" -H "Content-Type: application/json" \
 
 要求 Node ≥ 22.18（原生运行 TypeScript，无需 `npm install`）。
 
-**代理与隧道自测**（`test/proxy.test.mjs`，零依赖、默认离线）：
+**代理与隧道自测**（`test/proxy.test.mjs`、`test/proxy-pool.test.mjs`，零依赖、默认离线）：
 
 ```sh
-npm test                                             # 全套离线用例（等价 node --test test/proxy.test.mjs）
+npm test                                             # 全套离线用例（proxy.test.mjs + proxy-pool.test.mjs）
 npm test -- --test-name-pattern=tunnel               # 只跑隧道相关用例
 $env:SMOKE_LIVE='1'; node --test test/proxy.test.mjs # PowerShell：追加真网关端到端（需外网）
 SMOKE_LIVE=1 node --test test/proxy.test.mjs         # bash
@@ -360,6 +420,8 @@ SMOKE_LIVE=1 node --test test/proxy.test.mjs         # bash
 自签证书的本地 HTTPS 源站，覆盖：握手、认证、拒绝码、连接池复用（两次请求一次
 CONNECT）、`NO_PROXY` 分流、协议解析与掩码。端到端用例会用 `UPSTREAM_PROXY`
 指向本地假代理启动真网关，并断言上游 CONNECT 确实经过隧道。
+`test/proxy-pool.test.mjs` 把自动代理池完整跑一遍（列表解析、探活判定、轮换、
+冷却重试、补货策略），探针与 TCP 预筛都是注入的假实现——不发一个真实请求。
 
 ## 客户端配置（以 OpenWebUI 为例）
 

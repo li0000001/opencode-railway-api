@@ -7,6 +7,7 @@ WORKDIR /app
 COPY package.json ./
 COPY server.ts ./
 COPY proxy.ts ./
+COPY proxy-pool.ts ./
 COPY adapter/ ./adapter/
 
 ENV NODE_ENV=production
