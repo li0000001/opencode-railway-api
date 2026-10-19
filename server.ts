@@ -9,6 +9,7 @@
  *   - ids.ts      per-conversation stable session/request ids + CLI disguise
  *   - messages.ts the free-lane agent-shape gate (bash+read stub tools)
  *   - routing.ts  Responses-only model detection
+ *   - proxy.ts    upstream egress tunnels (HTTP CONNECT / HTTPS / SOCKS5) + NO_PROXY
  *
  * Endpoints (all but /health require `Authorization: Bearer <API_KEY>`):
  *   GET  /health            liveness + catalog status
@@ -35,6 +36,14 @@ import { ModelCatalog, isModelDeadSignal, ZEN_BASE_URL, type CatalogSnapshot } f
 import { deriveRequestIDs, disguiseHeaders } from './adapter/ids.ts'
 import { ensureFreeLaneShape, ensureResponsesFreeLaneShape } from './adapter/messages.ts'
 import { isResponsesModel } from './adapter/routing.ts'
+import {
+  TUNNEL_LATENCY,
+  createEgressFetch,
+  createTunnelAgent,
+  maskProxy,
+  resolveUpstreamProxy,
+  type TunnelEvent,
+} from './proxy.ts'
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -390,6 +399,84 @@ const keyPool = new KeyPool(ZEN_API_KEYS, {
 })
 
 // ---------------------------------------------------------------------------
+// Upstream egress proxy (UPSTREAM_PROXY / HTTPS_PROXY / ALL_PROXY)
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a proxy exists here at all: the free-lane gate weighs the *requesting
+ * IP*. Shared cloud egress (Render, Railway, AWS, …) is datacenter space, which
+ * the gate treats like a VPN/proxy and refuses outright — even with valid
+ * credentials ("we've detected abusive traffic from this IP address"). Pointing
+ * the upstream calls at a clean exit address is the fix; proxy.ts carries the
+ * tunnel implementations (HTTP CONNECT, HTTPS CONNECT, SOCKS5).
+ *
+ * `NO_PROXY` still wins per host, so a configuration can tunnel `opencode.ai`
+ * while leaving `models.dev` direct.
+ *
+ * Declared up here because the catalog (below) is the first consumer of the
+ * egress fetch; the transport agents it needs are declared further down.
+ */
+const egress = resolveUpstreamProxy()
+const PROXY_CONNECT_TIMEOUT_MS = numEnv('PROXY_CONNECT_TIMEOUT_MS', 20_000)
+/** The host the Zen API lives on: the egress decision that matters most. */
+const UPSTREAM_HOST = new URL(ZEN_BASE_URL).hostname
+const proxyTunnels = { ok: 0, failed: 0 }
+
+/** Tunnel telemetry: first success once, failures throttled to every 50th. */
+function noteTunnel(event: TunnelEvent): void {
+  if (event.ok) {
+    proxyTunnels.ok += 1
+    if (proxyTunnels.ok === 1) {
+      console.log(`[proxy] tunnel up: ${event.target} in ${event.ms}ms`)
+    }
+    return
+  }
+  proxyTunnels.failed += 1
+  if (proxyTunnels.failed === 1 || proxyTunnels.failed % 50 === 0) {
+    console.warn(`[proxy] tunnel to ${event.target} failed (${proxyTunnels.failed} so far): ${event.error?.message ?? 'unknown error'}`)
+  }
+}
+
+/** Tunnel agents, mirroring the direct pair (pooled + fresh-socket retry). */
+const proxiedAgents =
+  egress.proxy === null
+    ? null
+    : {
+        pooled: createTunnelAgent(egress.proxy, {
+          keepAlive: true,
+          maxSockets: 64,
+          maxFreeSockets: 2,
+          keepAliveMsecs: 30_000,
+          connectTimeoutMs: PROXY_CONNECT_TIMEOUT_MS,
+          lookup: cachedLookup,
+          onTunnel: noteTunnel,
+        }),
+        fresh: createTunnelAgent(egress.proxy, {
+          keepAlive: false,
+          maxSockets: 64,
+          connectTimeoutMs: PROXY_CONNECT_TIMEOUT_MS,
+          lookup: cachedLookup,
+          onTunnel: noteTunnel,
+        }),
+      }
+
+/**
+ * The agent for one upstream host: the tunnel agent when a proxy is configured
+ * and `NO_PROXY` does not cover that host, the direct agent otherwise.
+ */
+function upstreamAgentFor(host: string, fresh: boolean): https.Agent {
+  if (proxiedAgents !== null && !egress.noProxy.matches(host, 443)) {
+    return fresh ? proxiedAgents.fresh : proxiedAgents.pooled
+  }
+  return fresh ? freshAgent : upstreamAgent
+}
+
+/** True when the configured proxy actually carries the Zen traffic. */
+function proxyAppliesToUpstream(): boolean {
+  return proxiedAgents !== null && !egress.noProxy.matches(UPSTREAM_HOST, 443)
+}
+
+// ---------------------------------------------------------------------------
 // Model catalog (S1 live ∩ S2 free-decision, S3 static fallback)
 // ---------------------------------------------------------------------------
 
@@ -399,6 +486,14 @@ const catalog = new ModelCatalog({
   // list plus one ready pool key, so neither source's omissions hide a model
   // (chat still only ever uses the free ones the catalog exposes).
   authorization: () => keyPool.catalogAuthorizations(),
+  // Same egress as the chat path: the Zen models list rides the tunnel when a
+  // proxy is configured (models.dev follows the same per-host NO_PROXY rule).
+  fetchImpl: createEgressFetch({
+    proxy: egress.proxy,
+    noProxy: egress.noProxy,
+    connectTimeoutMs: PROXY_CONNECT_TIMEOUT_MS,
+    lookup: cachedLookup,
+  }),
   cachePath: process.env.CACHE_PATH || join(homedir(), '.opencode2dsh', 'railway-server.models.dev.json'),
   onRefresh: (status, lastError) => {
     console.log(
@@ -635,7 +730,7 @@ async function zenFetch(
     const stale = code === 'ECONNRESET' || code === 'EPIPE' || code === 'UND_ERR_SOCKET' || /socket hang up/i.test(String((err as Error).message))
     if (!stale) throw err
     console.warn(`[upstream] stale pooled socket (${code ?? 'hang up'}), retrying once on a fresh connection`)
-    response = await zenFetchOnce(url, upstreamBody, messages, signal, attempt, freshAgent)
+    response = await zenFetchOnce(url, upstreamBody, messages, signal, attempt, upstreamAgentFor(new URL(url).hostname, true))
   }
   // Credential failover: the 429/401 above already put that key in cooldown,
   // so the retry walks to the next ready key (or the anonymous lane). One
@@ -658,12 +753,15 @@ async function zenFetchOnce(
   messages: unknown,
   signal: AbortSignal,
   attempt: { entry: PoolEntry | null },
-  agent: https.Agent = upstreamAgent,
+  agentOverride?: https.Agent,
 ): Promise<UpstreamResponse> {
   const ids = deriveRequestIDs(
     Array.isArray(messages) ? (messages as Array<{ role: string; content: unknown }>) : [],
   )
   const target = new URL(url)
+  // Direct or tunnelled, decided per host: a configured proxy carries the Zen
+  // traffic unless NO_PROXY exempts this host (proxy.ts / upstreamAgentFor).
+  const agent = agentOverride ?? upstreamAgentFor(target.hostname, false)
   const payload = JSON.stringify(upstreamBody)
   // Sticky credential: the session id is derived from the conversation's first
   // user turn, so one conversation always rides the same key (and the same
@@ -737,10 +835,20 @@ async function zenFetchOnce(
     req.on('socket', (socket) => {
       // Small SSE chunks must leave immediately; Nagle only adds latency.
       socket.setNoDelay(true)
-      if (socket.connecting) {
+      // A tunnel agent hands over a socket that is *already connected* (the
+      // CONNECT/SOCKS5 handshake and TLS completed inside createConnection), so
+      // "connecting" is no longer a reliable proxy for "fresh". `reusedSocket`
+      // (set by the agent when the socket came out of the keep-alive pool) is:
+      // it is true exactly for sockets that can be silently half-dead.
+      const tunnelMs = (socket as unknown as Record<symbol, number | undefined>)[TUNNEL_LATENCY]
+      if (tunnelMs !== undefined) {
+        tlsMs = tunnelMs // fresh tunnel: report what the proxy hop actually cost
+      } else if (socket.connecting) {
         socket.once('secureConnect', () => { tlsMs = Date.now() - t0 })
       } else {
         tlsMs = 0 // pooled socket reused: no handshake at all
+      }
+      if (req.reusedSocket) {
         // A reused socket may have been reaped by the peer *silently*: the
         // write succeeds and we would then wait on TCP retransmits (~6s
         // measured) before the RST. Flag it ECONNRESET so zenFetch retries
@@ -2146,6 +2254,22 @@ function handleHealth(res: ServerResponse, snapshot: CatalogSnapshot): void {
     // Never a key itself — only which lane (and how many keys) is configured.
     upstreamAuth: keyPool.mode,
     ...(keyPool.size > 0 ? { pool: keyPool.snapshot() } : {}),
+    // Which route the upstream calls actually take. The proxy address itself is
+    // deliberately absent from this public endpoint (the status file and the
+    // logs carry it) — a leaked proxy endpoint invites exactly the abuse the
+    // abuse gate already suspects.
+    egress: {
+      proxy: egress.proxy === null ? null : {
+        protocol: egress.proxy.protocol,
+        authenticated: egress.proxy.username !== undefined,
+        source: egress.proxy.source,
+        appliesToUpstream: proxyAppliesToUpstream(),
+      },
+      tunnels: { ok: proxyTunnels.ok, failed: proxyTunnels.failed },
+      // A misconfigured value is flagged here but never echoed: the startup log
+      // and the status file carry the (redacted) message.
+      ...(egress.error === null ? {} : { proxyConfigError: true }),
+    },
     inflight: stats.inflight,
     requests: stats.requests,
     lastRequestAt: stats.lastRequestAt || null,
@@ -2237,6 +2361,15 @@ async function writeStatusFile(): Promise<void> {
       inflight: stats.inflight,
       requests: stats.requests,
       ...(keyPool.size > 0 ? { pool: keyPool.snapshot() } : {}),
+      // The private snapshot may name the proxy (host:port only, credentials
+      // never leave memory) — it stays on the deployment's own disk.
+      egress: {
+        proxy: egress.proxy === null ? null : maskProxy(egress.proxy),
+        source: egress.source,
+        appliesToUpstream: proxyAppliesToUpstream(),
+        tunnels: { ok: proxyTunnels.ok, failed: proxyTunnels.failed },
+        error: egress.error,
+      },
       upstream: {
         status: stats.lastUpstreamStatus,
         connectMs: stats.lastConnectMs,
@@ -2311,8 +2444,8 @@ let poolWarmed = false
 function warmUpstreamPool(): void {
   https
     .get(
-      'https://opencode.ai/zen/v1/models',
-      { agent: upstreamAgent, lookup: cachedLookup, headers: { authorization: keyPool.warmAuth(), 'x-opencode-client': 'cli' } },
+      `${ZEN_BASE_URL}/v1/models`,
+      { agent: upstreamAgentFor(UPSTREAM_HOST, false), lookup: cachedLookup, headers: { authorization: keyPool.warmAuth(), 'x-opencode-client': 'cli' } },
       (r) => {
         r.resume()
         r.on('end', () => {
@@ -2332,6 +2465,17 @@ warmTimer.unref?.()
 server.listen(PORT, () => {
   console.log(`[opencode2dsh-railway] listening on :${PORT}`)
   console.log(`[opencode2dsh-railway] upstream: ${ZEN_BASE_URL}`)
+  if (egress.error !== null) {
+    console.warn(`[proxy] ${egress.error} — continuing with a direct upstream connection`)
+  } else if (egress.proxy === null) {
+    console.log('[proxy] upstream egress: direct (set UPSTREAM_PROXY / HTTPS_PROXY / ALL_PROXY to route it through a clean exit)')
+  } else if (proxyAppliesToUpstream()) {
+    console.log(`[proxy] upstream egress: ${maskProxy(egress.proxy)} via ${egress.proxy.source}`)
+  } else {
+    console.warn(
+      `[proxy] ${egress.proxy.source}=${maskProxy(egress.proxy)} is configured but NO_PROXY exempts ${UPSTREAM_HOST} — upstream traffic stays direct`,
+    )
+  }
   if (keyPool.size === 0) {
     console.log(
       '[opencode2dsh-railway] upstream auth: anonymous free lane "Bearer public" - ' +
@@ -2373,6 +2517,8 @@ function shutdown(signal: string): void {
     server.closeAllConnections?.()
     upstreamAgent.destroy()
     freshAgent.destroy()
+    proxiedAgents?.pooled.destroy()
+    proxiedAgents?.fresh.destroy()
     process.exit(0)
   }, SHUTDOWN_DRAIN_MS)
   force.unref()

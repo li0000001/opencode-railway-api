@@ -8,6 +8,7 @@
     "node": ">=22.18"
   },
   "scripts": {
-    "start": "node server.ts"
+    "start": "node server.ts",
+    "test": "node --test"
   }
 }

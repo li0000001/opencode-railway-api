@@ -142,6 +142,9 @@ Studio 或任何支持 `base_url + API key` 的客户端调用。
 | `POOL_WARM_INTERVAL_MS` | 否 | `20000` | 上游连接池保活心跳间隔（见下）。小于对端空闲回收时间，避免空闲后复用「半死」连接 |
 | `POOLED_HEADER_TIMEOUT_MS` | 否 | `10000` | **复用连接看门狗**：仅针对从池里复用的 keep-alive 连接，若该窗口内没收到上游响应头就判为半开失效，换新连接重试一次（新连接不受此限，它本来就要付 DNS+TCP+TLS）。原默认 `2500` 低于上游实际响应头耗时（实测 2.6–9.7s），会误杀正常连接并 502，故放宽——真死连接由 OS 的 ~6s RST 兜底 |
 | `DNS_TTL_MS` | 否 | `60000` | 上游 DNS 结果缓存时长；解析失败时回退到过期缓存 |
+| `UPSTREAM_PROXY` | 否 | — | **出口代理**：上游流量（`opencode.ai` + `models.dev`）改由该代理出去，见下节。支持 `http://`、`https://`、`socks5://`（`socks5h://`、`socks://` 等价，域名一律交给代理解析）。也认标准变量 `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY`，优先级：`UPSTREAM_PROXY` > `HTTPS_PROXY` > `ALL_PROXY` > `HTTP_PROXY`；不设则直连（与旧行为一致） |
+| `NO_PROXY` | 否 | — | 逗号分隔的直连名单（按目标主机逐个判断）：`models.dev` 让元数据走直连、`*` 表示全部直连。支持 `.example.com`（含子域）与 `host:port`（限定端口） |
+| `PROXY_CONNECT_TIMEOUT_MS` | 否 | `20000` | 建隧道总预算：连代理 + CONNECT/SOCKS5 握手 + 隧道内 TLS 握手。超时按普通上游错误处理（502，可被 key 池/重试逻辑看见） |
 | `ZEN_ACCESS_TOKEN` | **是（免费模型）** | — | **上游凭证**：OpenCode 账号 OAuth token（`st_…`，约 30 天过期）。免费模型只认它。取法见仓库根 `docs/zen-free-lane-ops.md` 第 3 节。key 不写日志、不被任何接口回显（`/health` 只报 `st_***` 掩码） |
 | `ZEN_SESSION_TOKEN` | 否 | — | `ZEN_ACCESS_TOKEN` 的别名 |
 | `ZEN_CLIENT_VERSION` | 否 | `2.0.29` | 伪装 UA 里的官方客户端版本号，跟随 OpenCode 发版改即可 |
@@ -214,6 +217,83 @@ railway variables set ZEN_API_KEYS=<key1>,<key2>   # 池（付费模型）
 2. **key 只放 Railway 的 Variables**，不要提交进仓库；下游客户端用的仍是自己的
    `API_KEY`，两者互不相干。上游 key 不会出现在日志、`/health` 或任何响应里。
 
+## 出口代理（`UPSTREAM_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`）
+
+### 为什么需要它
+
+免费模型的门禁按**请求方 IP** 判定。共享云出口（Render / Railway / AWS / GCP…）属于
+数据中心段，在门禁眼里等同 VPN/代理，于是即便凭证完全正确也会被整段拒绝：
+
+```
+HTTP 403 FreeTierError: OpenCode's free models aren't available from your current
+network because we've detected abusive traffic from this IP address. ...
+If you're on a VPN or proxy, turn it off and try again.
+```
+
+换 key 无用（所有 key 都从同一个 IP 出去，且 403 不冷却 key）。唯一的解法是把上游流量
+改从**干净出口**发出——就是本节的开关。网关其余部分不做任何改变（伪装头、形状门禁、
+连接池、看门狗、key 池全部保留）。
+
+> 注意：门禁拒绝的是**免费模型推理**。同一个被拒 IP 上 `GET /v1/models` 依旧 200，
+> 所以「目录正常、聊天全 403」这个组合恰恰就是出口被判滥用的特征。
+
+### 用法
+
+```sh
+# http CONNECT 代理（明文）
+railway variables set UPSTREAM_PROXY=http://1.2.3.4:3128
+# 需要认证：把 user:pass 写进 URL（日志里只会出现 user:***）
+railway variables set UPSTREAM_PROXY=http://user:pass@1.2.3.4:3128
+# 本地 Clash/v2ray 常见形态（域名交给代理解析，即 socks5h 语义）
+railway variables set UPSTREAM_PROXY=socks5://user:pass@1.2.3.4:1080
+# 只让 Zen 走代理、models.dev 直连
+railway variables set NO_PROXY=models.dev
+```
+
+| 项 | 说明 |
+| --- | --- |
+| 支持的协议 | `http://`（CONNECT）、`https://`（先 TLS 连代理再 CONNECT）、`socks5://`；`socks5h://`、`socks://` 与 `socks5://` 等价 |
+| 省略端口时 | `http` → 8080、`https` → 443、`socks5` → 1080 |
+| 变量优先级 | `UPSTREAM_PROXY` > `HTTPS_PROXY` > `ALL_PROXY` > `HTTP_PROXY`（两种大小写拼写都认；`UPSTREAM_PROXY` 的存在是为了不误继承其他程序的全局代理变量） |
+| 走代理的流量 | 聊天/Responses 上游请求、连接池保活心跳、Zen `/v1/models`、models.dev 元数据（被 `NO_PROXY` 命中则直连） |
+| `NO_PROXY` | 逗号/空白分隔，支持 `host`、`.domain`（含子域）、`host:port`（限定端口）、`*`（全部直连） |
+| **不做的事** | **不会**在代理失败时静默回退直连——直连正是被门禁拒绝的那条路。失败按普通上游错误暴露（客户端 502），并打日志 `[proxy] tunnel to opencode.ai:443 failed …`（首次 + 每 50 次一条，避免刷屏） |
+
+### 怎么确认生效
+
+1. 启动日志会写出实际路由：
+
+   ```
+   [proxy] upstream egress: socks5://1.2.3.4:1080 via UPSTREAM_PROXY
+   ```
+
+   若被 `NO_PROXY` 挡掉会是警告行；若 URL 写错，会打印原因并继续直连（服务不崩）。
+
+2. `GET /health` 的 `egress` 块（公网可见，**故意不含代理地址**，避免泄出口）：
+
+   ```jsonc
+   "egress": {
+     "proxy": { "protocol": "socks5", "authenticated": true, "source": "UPSTREAM_PROXY", "appliesToUpstream": true },
+     "tunnels": { "ok": 3, "failed": 0 }
+   },
+   ```
+
+3. 发一次聊天再看 `upstream.status`：`403` = 出口仍被判滥用（换出口）；`200` = 代理生效。
+   `STATUS_PATH` 落盘的快照里有完整代理地址（仅落盘，不回显公网）。
+
+### 实现与代价
+
+- 隧道建在 `https.Agent.createConnection` 内部，因此连接池、`maxSockets`、
+  「复用连接看门狗」（按 `req.reusedSocket` 判定，隧道连接握手在交回前已完成）、
+  DNS 缓存（改为解析代理域名）全部照旧；一条池化连接 = 一次 CONNECT，之后的请求复用同一条隧道。
+- 隧道内的 TLS 由网关自己完成（SNI = 目标主机，ALPN 固定 `http/1.1`），所以代理模式下
+  新建连接不复用 TLS session（池化复用不受影响，代价可忽略）。
+- 零依赖：CONNECT 与 SOCKS5（RFC 1928 + RFC 1929 认证）都在 `proxy.ts` 里手写，
+  Node ≥ 22.18 均可跑，不依赖 Node 24 的 `NODE_USE_ENV_PROXY`。
+- 代理是新的单点：它挂了上游就全挂。生产建议用固定 IP 的小 VPS / 住宅出口；
+  若多个部署共用同一个出口 IP，仍可能被一起判滥用。
+- 代理密码与上游 key 一样只存在于内存和掩码日志里（`socks5://user:***@host:1080`）。
+
 ## 部署到 Railway
 
 本目录是**自包含**的：`adapter/` 已拷入插件源码，`railway.json` + `Dockerfile`
@@ -221,8 +301,9 @@ railway variables set ZEN_API_KEYS=<key1>,<key2>   # 池（付费模型）
 
 方式 A —— GitHub 仓库（推荐）：
 
-1. 新建一个 GitHub 仓库，把**本文件夹的全部内容**（6 项：`Dockerfile`、
-   `railway.json`、`package.json`、`server.ts`、`README.md`、`adapter/`）放进去。
+1. 新建一个 GitHub 仓库，把**本文件夹的全部内容**（7 项：`Dockerfile`、
+   `railway.json`、`package.json`、`server.ts`、`proxy.ts`、`README.md`、`adapter/`）
+   放进去（`test/` 可选，只用于本机自测）。
 2. Railway → **New Project → Deploy from GitHub repo**，选择该仓库。
    本目录的 `railway.json` 会自动选用 `Dockerfile` 构建。
 3. **Settings → Variables** 添加 `API_KEY`（自生成一个强随机串）和
@@ -265,6 +346,20 @@ curl -H "Authorization: Bearer test-key" -H "Content-Type: application/json" \
 `Get-ChildItem env: | Where-Object { $_.Name -like 'ZEN*' } | ForEach-Object { Remove-Item "env:$($_.Name)" }`。
 
 要求 Node ≥ 22.18（原生运行 TypeScript，无需 `npm install`）。
+
+**代理与隧道自测**（`test/proxy.test.mjs`，零依赖、默认离线）：
+
+```sh
+npm test                                             # 全套离线用例（等价 node --test test/proxy.test.mjs）
+npm test -- --test-name-pattern=tunnel               # 只跑隧道相关用例
+$env:SMOKE_LIVE='1'; node --test test/proxy.test.mjs # PowerShell：追加真网关端到端（需外网）
+SMOKE_LIVE=1 node --test test/proxy.test.mjs         # bash
+```
+
+离线用例自带一个假 CONNECT 代理、一个假 SOCKS5 代理（含 user/pass 认证）和一个
+自签证书的本地 HTTPS 源站，覆盖：握手、认证、拒绝码、连接池复用（两次请求一次
+CONNECT）、`NO_PROXY` 分流、协议解析与掩码。端到端用例会用 `UPSTREAM_PROXY`
+指向本地假代理启动真网关，并断言上游 CONNECT 确实经过隧道。
 
 ## 客户端配置（以 OpenWebUI 为例）
 
